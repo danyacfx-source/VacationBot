@@ -5,6 +5,11 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+DATA_DIR = os.getenv("DATA_DIR", "")
+if DATA_DIR:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.chdir(DATA_DIR)
+
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = discord.Object(id=int(os.getenv("GUILD_ID", "0"))) if os.getenv("GUILD_ID") else None
 
