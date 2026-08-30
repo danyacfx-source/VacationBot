@@ -1,7 +1,7 @@
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set WshShell = CreateObject("WScript.Shell")
 
-vacationDir = "C:\Users\Admin\Desktop\Ботинок\VacationBot"
+vacationDir = "C:\Users\Admin\Desktop\пїЅпїЅпїЅпїЅпїЅпїЅпїЅ\VacationBot"
 roleBotDir  = "C:\Users\Admin\Documents\Default Project\discord-role-bot"
 pythonw     = "C:\Users\Admin\AppData\Local\Programs\Python\Python312\pythonw.exe"
 
@@ -17,7 +17,24 @@ Function IsRunning(botPath)
     Next
 End Function
 
+Function IsProcAlive(procName)
+    IsProcAlive = False
+    Set colProcesses = GetObject("winmgmts:\\.\root\cimv2").ExecQuery( _
+        "SELECT Name FROM Win32_Process WHERE Name='" & procName & "'")
+    For Each objProcess in colProcesses
+        If LCase(objProcess.Name) = LCase(procName) Then
+            IsProcAlive = True
+            Exit Function
+        End If
+    Next
+End Function
+
 Do
+
+    If Not IsProcAlive("xray-oversub.exe") Then
+        WshShell.Run """C:\Users\Admin\AppData\Local\Programs\xray\xray-oversub.exe"" -c ""C:\Users\Admin\AppData\Local\Programs\xray\config-oversub.json""", 0, False
+    End If
+
     If Not IsRunning(vacationDir & "\bot.py") Then
         If Not fso.FileExists(vacationDir & "\bot.paused") Then
             WshShell.Run """" & pythonw & """ """ & vacationDir & "\bot.py""", 0, False

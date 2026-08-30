@@ -6,6 +6,15 @@ __pycache__/
 *.db-shm
 *.db-wal
 *.bak
+*.zip
 bot.log
 vacation_logs.txt
 opencode
+bot_state.json
+all_members.json
+members.json
+vacations.json
+casino.json
+events.json
+member_stats.json
+tickets.json

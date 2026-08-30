@@ -17,9 +17,13 @@ async def api_handle_status(request):
         return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
     bot = request.app["bot"]
     uptime = datetime.datetime.utcnow() - bot.launch_time if hasattr(bot, "launch_time") else None
+    try:
+        latency_ms = round(bot.latency * 1000)
+    except (OverflowError, ValueError, TypeError):
+        latency_ms = None
     return aiohttp.web.json_response({
         "status": "online",
-        "latency_ms": round(bot.latency * 1000),
+        "latency_ms": latency_ms,
         "guilds": len(bot.guilds),
         "users": len(bot.users),
         "commands": len(bot.tree.get_commands()),

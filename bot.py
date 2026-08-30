@@ -28,7 +28,17 @@ logging.basicConfig(
     ]
 )
 
-bot = commands.Bot(command_prefix="!", intents=config.intents, reconnect=True, max_messages=None)
+# Прокси для соединения с Discord (если задан в конфиге), передаётся в session discord.py.
+_proxy_url = getattr(config, "PROXY_URL", "") or ""
+if _proxy_url.lower() in ("", "none", "system", "off", "0"):
+    _proxy_url = ""
+
+_bot_options = {}
+if _proxy_url:
+    _bot_options["proxy"] = _proxy_url
+
+bot = commands.Bot(command_prefix="!", intents=config.intents, reconnect=True, max_messages=None,
+                   **_bot_options)
 
 @app_commands.command(name="ping", description="Проверка, что бот работает")
 async def ping_cmd(interaction: discord.Interaction):
