@@ -348,6 +348,13 @@ class TempVoiceCog(commands.Cog):
 
         if before.channel and not _is_trigger_channel(before.channel) and _is_managed_category(before.channel.category_id):
             vc = before.channel
+
+            if after.channel and after.channel.id == vc.id:
+                return
+
+            leaving_owner = (
+                vc.id in temp_channel_owners and temp_channel_owners[vc.id] == member.id
+            )
             async with _channel_lock(vc.id):
                 remaining = [m for m in vc.members if not m.bot]
                 if not remaining:
@@ -359,8 +366,14 @@ class TempVoiceCog(commands.Cog):
                         temp_channel_owners.pop(vc.id, None)
                     except Exception as e:
                         logging.error("Ошибка удаления временного канала: %s", e)
-                elif vc.id in temp_channel_owners and temp_channel_owners[vc.id] == member.id:
-                    new_owner = remaining[0]
+                elif leaving_owner:
+                    new_owner = None
+                    for m in remaining:
+                        if temp_channel_owners.get(vc.id) != m.id:
+                            new_owner = m
+                            break
+                    if new_owner is None:
+                        new_owner = remaining[0]
                     temp_channel_owners[vc.id] = new_owner.id
                     logging.info("Владелец канала %s теперь %s", vc.name, new_owner)
                     embed = discord.Embed(
