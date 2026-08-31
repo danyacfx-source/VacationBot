@@ -285,7 +285,7 @@ async def on_ready():
         from cogs.vacations import RequestPanelView, LegacyVacationPanelView
         from cogs.roles import RolePanelView
         from cogs.temp_voice import TempChannelView
-        from cogs.events import EventRSVPView
+        from cogs.events import EventRSVPSelectView
 
         bot.add_view(RequestPanelView())
         bot.add_view(LegacyVacationPanelView())
@@ -295,7 +295,7 @@ async def on_ready():
         bot.add_view(ArmaPanelView())
         bot.add_view(RolePanelView())
         bot.add_view(TempChannelView())
-        bot.add_view(EventRSVPView("0"))
+        bot.add_view(EventRSVPSelectView("0"))
         bot.add_view(TicketClosedView())
 
         # Sync commands
