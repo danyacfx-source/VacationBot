@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import logging
+import time
 import traceback
 from datetime import timedelta
 
@@ -17,6 +18,10 @@ import config
 class LoggingHandlers(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # Анти-дубль голосовых логов: Discord иногда шлёт один и тот же
+        # voice_state_update несколько раз подряд.
+        self._voice_log_dedup = {}
+        self._VOICE_DEDUP_SECONDS = 6
 
     @commands.Cog.listener()
     async def on_member_join(self, member):
@@ -587,7 +592,38 @@ class LoggingHandlers(commands.Cog):
             if not log_channel:
                 return
 
+            # Подавление дублей: одинаковое событие от того же участника
+            # в течение короткого окна не отправляем повторно.
+            async def dedup(embed: discord.Embed) -> bool:
+                key = (
+                    member.id,
+                    before.channel.id if before.channel else 0,
+                    after.channel.id if after.channel else 0,
+                    bool(after.self_mute),
+                    bool(after.self_deaf),
+                    bool(after.mute),
+                    bool(after.deaf),
+                    getattr(after, "stream", False),
+                    getattr(after, "video", False),
+                )
+                now = time.monotonic()
+                last = self._voice_log_dedup.get(key)
+                if last is not None and (now - last) < self._VOICE_DEDUP_SECONDS:
+                    logging.info(
+                        "voice log подавлен (дубль) для %s", member
+                    )
+                    return False
+                self._voice_log_dedup[key] = now
+                if len(self._voice_log_dedup) > 500:
+                    cutoff = now - self._VOICE_DEDUP_SECONDS
+                    stale = [k for k, v in self._voice_log_dedup.items() if v < cutoff]
+                    for k in stale:
+                        del self._voice_log_dedup[k]
+                return True
+
             async def send_safe(embed):
+                if not await dedup(embed):
+                    return
                 for attempt in range(3):
                     try:
                         await log_channel.send(embed=embed)
@@ -680,7 +716,7 @@ class LoggingHandlers(commands.Cog):
                     )
                     embed.set_thumbnail(url=member.display_avatar.url)
                     embed.set_footer(text=f"id участника: {member.id}•{time_str}")
-                    await log_channel.send(embed=embed)
+                    await send_safe(embed)
 
         except Exception as e:
             logging.error("on_voice_state_update error: %s", e)
