@@ -14,6 +14,14 @@ temp_channel_owners: dict[int, int] = {}
 _channel_locks: dict[int, asyncio.Lock] = {}
 
 
+def _is_trigger_channel(vc) -> bool:
+    return vc.id in (config.VC_TRIGGER_CHANNEL, config.VC_WARDogs_TRIGGER_CHANNEL)
+
+
+def _is_managed_category(category_id) -> bool:
+    return category_id in (config.VC_CATEGORY, config.VC_WARDogs_CATEGORY)
+
+
 def _channel_lock(channel_id: int) -> asyncio.Lock:
     lock = _channel_locks.get(channel_id)
     if lock is None:
@@ -37,7 +45,7 @@ class TempChannelKickModal(discord.ui.Modal, title="Выгнать участн�
 
         vc = interaction.user.voice.channel
 
-        if vc.id == config.VC_TRIGGER_CHANNEL or vc.category_id != config.VC_CATEGORY:
+        if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
                 "Нельзя управлять этим каналом.", ephemeral=True
             )
@@ -89,7 +97,7 @@ class TempChannelRenameModal(discord.ui.Modal, title="Переименовать
 
         vc = interaction.user.voice.channel
 
-        if vc.id == config.VC_TRIGGER_CHANNEL or vc.category_id != config.VC_CATEGORY:
+        if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
                 "Нельзя управлять этим каналом.", ephemeral=True
             )
@@ -122,7 +130,7 @@ class TempChannelLimitModal(discord.ui.Modal, title="Лимит участник
 
         vc = interaction.user.voice.channel
 
-        if vc.id == config.VC_TRIGGER_CHANNEL or vc.category_id != config.VC_CATEGORY:
+        if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
                 "Нельзя управлять этим каналом.", ephemeral=True
             )
@@ -168,7 +176,7 @@ class TempChannelView(discord.ui.View):
             )
 
         vc = interaction.user.voice.channel
-        if vc.id == config.VC_TRIGGER_CHANNEL or vc.category_id != config.VC_CATEGORY:
+        if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
                 "Нельзя управлять этим каналом.", ephemeral=True
             )
@@ -237,23 +245,24 @@ class TempVoiceCog(commands.Cog):
     @tasks.loop(seconds=60)
     async def cleanup_empty_channels(self):
         for guild in self.bot.guilds:
-            category = guild.get_channel(config.VC_CATEGORY)
-            if not category:
-                continue
-            for ch in list(category.voice_channels):
-                if ch.id == config.VC_TRIGGER_CHANNEL:
+            for cat_id in (config.VC_CATEGORY, config.VC_WARDogs_CATEGORY):
+                category = guild.get_channel(cat_id)
+                if not category:
                     continue
-                humans = [m for m in ch.members if not m.bot]
-                if not humans:
-                    async with _channel_lock(ch.id):
-                        try:
-                            temp_channel_owners.pop(ch.id, None)
-                            await ch.delete(reason="Периодическая очистка временных каналов")
-                            logging.info("Очищен пустой временный канал %s (периодическая уборка)", ch.name)
-                        except discord.NotFound:
-                            temp_channel_owners.pop(ch.id, None)
-                        except Exception as e:
-                            logging.error("Ошибка периодической очистки канала %s: %s", ch.name, e)
+                for ch in list(category.voice_channels):
+                    if _is_trigger_channel(ch):
+                        continue
+                    humans = [m for m in ch.members if not m.bot]
+                    if not humans:
+                        async with _channel_lock(ch.id):
+                            try:
+                                temp_channel_owners.pop(ch.id, None)
+                                await ch.delete(reason="Периодическая очистка временных каналов")
+                                logging.info("Очищен пустой временный канал %s (периодическая уборка)", ch.name)
+                            except discord.NotFound:
+                                temp_channel_owners.pop(ch.id, None)
+                            except Exception as e:
+                                logging.error("Ошибка периодической очистки канала %s: %s", ch.name, e)
 
     @cleanup_empty_channels.before_loop
     async def before_cleanup(self):
@@ -265,39 +274,47 @@ class TempVoiceCog(commands.Cog):
             self.cleanup_empty_channels.start()
         try:
             for guild in self.bot.guilds:
-                category = guild.get_channel(config.VC_CATEGORY)
-                if not category:
-                    continue
-                for ch in list(category.voice_channels):
-                    if ch.id == config.VC_TRIGGER_CHANNEL:
+                for cat_id in (config.VC_CATEGORY, config.VC_WARDogs_CATEGORY):
+                    category = guild.get_channel(cat_id)
+                    if not category:
                         continue
-                    humans = [m for m in ch.members if not m.bot]
-                    if not humans:
-                        async with _channel_lock(ch.id):
-                            try:
-                                temp_channel_owners.pop(ch.id, None)
-                                await ch.delete(reason="Очистка пустого временного канала")
-                                logging.info("Очищен пустой временный канал %s", ch.name)
-                            except discord.NotFound:
-                                temp_channel_owners.pop(ch.id, None)
-                            except Exception as e:
-                                logging.error("Ошибка очистки временного канала %s: %s", ch.name, e)
-                    elif ch.id not in temp_channel_owners:
-                        temp_channel_owners[ch.id] = humans[0].id
-                        logging.info("Восстановлен владелец канала %s теперь %s", ch.name, humans[0])
+                    for ch in list(category.voice_channels):
+                        if _is_trigger_channel(ch):
+                            continue
+                        humans = [m for m in ch.members if not m.bot]
+                        if not humans:
+                            async with _channel_lock(ch.id):
+                                try:
+                                    temp_channel_owners.pop(ch.id, None)
+                                    await ch.delete(reason="Очистка пустого временного канала")
+                                    logging.info("Очищен пустой временный канал %s", ch.name)
+                                except discord.NotFound:
+                                    temp_channel_owners.pop(ch.id, None)
+                                except Exception as e:
+                                    logging.error("Ошибка очистки временного канала %s: %s", ch.name, e)
+                        elif ch.id not in temp_channel_owners:
+                            temp_channel_owners[ch.id] = humans[0].id
+                            logging.info("Восстановлен владелец канала %s теперь %s", ch.name, humans[0])
 
-                trigger = guild.get_channel(config.VC_TRIGGER_CHANNEL)
-                if trigger and any(not m.bot for m in trigger.members):
-                    first = next(m for m in trigger.members if not m.bot)
-                    await self._create_temp_channel(first, trigger)
+                for trigger_id in (config.VC_TRIGGER_CHANNEL, config.VC_WARDogs_TRIGGER_CHANNEL):
+                    trigger = guild.get_channel(trigger_id)
+                    if trigger and any(not m.bot for m in trigger.members):
+                        first = next(m for m in trigger.members if not m.bot)
+                        await self._create_temp_channel(first, trigger)
         except Exception as e:
             logging.error("Ошибка очистки временных каналов: %s", e)
 
     async def _create_temp_channel(self, member: discord.Member, trigger_channel):
-        category = member.guild.get_channel(config.VC_CATEGORY)
+        if trigger_channel.id == config.VC_WARDogs_TRIGGER_CHANNEL:
+            cat_id = config.VC_WARDogs_CATEGORY
+            name = "Wardogs"
+        else:
+            cat_id = config.VC_CATEGORY
+            name = "Клановый"
+        category = member.guild.get_channel(cat_id)
         try:
             vc = await member.guild.create_voice_channel(
-                name="Клановый",
+                name=name,
                 category=category,
                 reason="Временный канал"
             )
@@ -323,13 +340,13 @@ class TempVoiceCog(commands.Cog):
         if member.bot:
             return
 
-        if before.channel and before.channel.id == config.VC_TRIGGER_CHANNEL:
+        if before.channel and _is_trigger_channel(before.channel):
             return
 
-        if after.channel and after.channel.id == config.VC_TRIGGER_CHANNEL:
+        if after.channel and _is_trigger_channel(after.channel):
             await self._create_temp_channel(member, after.channel)
 
-        if before.channel and before.channel.id != config.VC_TRIGGER_CHANNEL and before.channel.category_id == config.VC_CATEGORY:
+        if before.channel and not _is_trigger_channel(before.channel) and _is_managed_category(before.channel.category_id):
             vc = before.channel
             async with _channel_lock(vc.id):
                 remaining = [m for m in vc.members if not m.bot]
