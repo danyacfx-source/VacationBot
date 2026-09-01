@@ -229,6 +229,7 @@ COGS = [
     "cogs.fun",
     "cogs.stats",
     "cogs.moderation",
+    "cogs.welcome",
     "handlers",
 ]
 

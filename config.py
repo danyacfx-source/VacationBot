@@ -15,8 +15,8 @@ GUILD_ID = discord.Object(id=int(os.getenv("GUILD_ID", "0"))) if os.getenv("GUIL
 
 # Прокси для соединения с Discord (например, встроенный VPN SOCKS/HTTP-прокси).
 # Если пусто или "system" — используется прокси из переменных окружения (HTTP_PROXY/HTTPS_PROXY),
-# иначе строкой вида "http://127.0.0.1:10809" или "socks5://127.0.0.1:10808".
-PROXY_URL = os.getenv("DISCORD_PROXY", "")
+# иначе строкой вида "http://127.0.0.1:10811" или "socks5://127.0.0.1:10808".
+PROXY_URL = os.getenv("DISCORD_PROXY", "http://127.0.0.1:10811")
 VACATION_CHANNEL = int(os.getenv("VACATION_CHANNEL", "0"))
 LOG_CHANNEL = 1532771198642028807
 STARTUP_LOG_CHANNEL = 1526326063020638288
@@ -29,6 +29,22 @@ JOIN_LOG_CHANNEL = 1500577590040203274
 JOIN_ROLES = [
     int(x) for x in os.getenv("JOIN_ROLES", "").replace(" ", "").split(",") if x.strip().isdigit()
 ]
+WELCOME_DM_ENABLED = os.getenv("WELCOME_DM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+WELCOME_CHANNEL = int(os.getenv("WELCOME_CHANNEL", "0"))
+WELCOME_LEAVE_CHANNEL = int(os.getenv("WELCOME_LEAVE_CHANNEL", "0"))
+WELCOME_TITLE = os.getenv("WELCOME_TITLE", "Добро пожаловать в клан!")
+WELCOME_CLAN_NAME = os.getenv("WELCOME_CLAN_NAME", "")
+WELCOME_INTRO = os.getenv(
+    "WELCOME_INTRO",
+    "Рады видеть тебя в нашем клане! 🎖️\n\n"
+    "Мы развиваем **3 направления**:\n"
+    "🛡️ **Wardogs**\n"
+    "🎖️ **Arma**\n"
+    "🔫 **SQUAD**\n\n"
+    "Чтобы выбрать направление и подать заявку (SQUAD, Arma и др.) — загляни сюда: <#1544243462478762014>\n\n"
+    "Ознакомься с правилами и веди себя достойно — у нас дружный коллектив. Добро пожаловать в команду!",
+)
+WELCOME_FOOTER = os.getenv("WELCOME_FOOTER", "Приятного времяпрепровождения!")
 ROLE_LOG_CHANNEL = 1500578653631807560
 MODERATION_LOG_CHANNEL = 1500582616867536966
 CHANNEL_LOG_CHANNEL = 1500578793197273329
