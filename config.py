@@ -33,7 +33,7 @@ WELCOME_DM_ENABLED = os.getenv("WELCOME_DM_ENABLED", "true").lower() in ("1", "t
 WELCOME_CHANNEL = int(os.getenv("WELCOME_CHANNEL", "0"))
 WELCOME_LEAVE_CHANNEL = int(os.getenv("WELCOME_LEAVE_CHANNEL", "0"))
 WELCOME_TITLE = os.getenv("WELCOME_TITLE", "Добро пожаловать в клан!")
-WELCOME_CLAN_NAME = os.getenv("WELCOME_CLAN_NAME", "")
+WELCOME_CLAN_NAME = os.getenv("WELCOME_CLAN_NAME", "GMS - Group Military Slavic")
 WELCOME_INTRO = os.getenv(
     "WELCOME_INTRO",
     "Рады видеть тебя в нашем клане! 🎖️\n\n"
