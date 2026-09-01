@@ -230,6 +230,7 @@ COGS = [
     "cogs.stats",
     "cogs.moderation",
     "cogs.welcome",
+    "cogs.direction_roles",
     "handlers",
 ]
 

@@ -94,6 +94,14 @@ ROLE_PANEL_ROLES = [
     (1484608030950559896, "Сидер", discord.ButtonStyle.secondary),
 ]
 
+# Панель выбора направления (выдача маркер-ролей по реакции, можно несколько).
+DIRECTION_CHANNEL = 1544243462478762014
+DIRECTION_ROLES = [
+    ("🛡️", "Wardogs"),
+    ("🎖️", "Arma"),
+    ("🎯", "Squad"),
+]
+
 EMBED_COLORS = {
     "red": discord.Color.red(),
     "green": discord.Color.green(),
