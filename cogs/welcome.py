@@ -1,6 +1,7 @@
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import config
@@ -105,6 +106,26 @@ class WelcomeCog(commands.Cog):
             )
         embed.set_footer(text=config.WELCOME_FOOTER)
         return embed
+
+    @app_commands.command(name="welcome_test", description="[Админ] Отправить тестовое welcome-сообщение в ЛС")
+    @app_commands.describe(user="Кому отправить в ЛС")
+    async def welcome_test(self, interaction: discord.Interaction, user: discord.Member):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Нет прав.", ephemeral=True)
+        embed = self._build_embed(user)
+        try:
+            await user.send(embed=embed)
+            await interaction.response.send_message(
+                f"✅ Тестовое welcome-сообщение отправлено в ЛС {user.mention}", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ Не удалось отправить ЛС {user.mention} (у пользователя закрыты ЛС)", ephemeral=True
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                f"❌ Ошибка отправки ЛС {user.mention}", ephemeral=True
+            )
 
 
 async def setup(bot: commands.Bot):
