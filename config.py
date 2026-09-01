@@ -13,10 +13,6 @@ if DATA_DIR:
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = discord.Object(id=int(os.getenv("GUILD_ID", "0"))) if os.getenv("GUILD_ID") else None
 
-# Прокси для соединения с Discord (например, встроенный VPN SOCKS/HTTP-прокси).
-# Если пусто или "system" — используется прокси из переменных окружения (HTTP_PROXY/HTTPS_PROXY),
-# иначе строкой вида "http://127.0.0.1:10811" или "socks5://127.0.0.1:10808".
-PROXY_URL = os.getenv("DISCORD_PROXY", "http://127.0.0.1:10811")
 VACATION_CHANNEL = int(os.getenv("VACATION_CHANNEL", "0"))
 LOG_CHANNEL = 1532771198642028807
 STARTUP_LOG_CHANNEL = 1526326063020638288
