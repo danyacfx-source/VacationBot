@@ -25,6 +25,16 @@ CLAN_APPLICATION_FORM = (
     "**6.** Какой у вас средний онлайн в неделю?"
 )
 
+CLAN_PANEL_DESCRIPTION = (
+    "🗓️ Возраст - от 16 лет\n"
+    "🧘 Адекватность, стрессоустойчивость, спокойствие в критических ситуациях\n"
+    "🎙️ Наличие микрофона - обязательно.\n\n"
+    "🤝 Взаимный опыт\n"
+    "😊 Приятная атмосфера\n"
+    "🎮 Помощь в освоении механик игры\n\n"
+    "💎 P.S. В будущем будет VIP на сервера, которые приглянутся"
+)
+
 CLAN_TICKET_TYPE = "clan"
 
 
@@ -259,7 +269,7 @@ class ClanTicketCog(commands.Cog):
 
         embed = discord.Embed(
             title="⚔️ ЗАЯВКА В КЛАН",
-            description=CLAN_APPLICATION_FORM,
+            description=CLAN_PANEL_DESCRIPTION,
             color=discord.Color.gold(),
         )
         embed.set_footer(text="Нажмите кнопку ниже, чтобы подать заявку.")
