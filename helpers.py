@@ -13,7 +13,6 @@ from config import (
     TICKET_LOG_CHANNEL,
     VACATION_LOG_CHANNEL,
     DATA_FILE,
-    TICKETS_DATA_FILE,
     BIRTHDAY_FILE,
     EVENTS_FILE,
     ERROR_ROLE,
@@ -173,19 +172,26 @@ def load_tickets():
     from database import get_conn
     conn = get_conn()
     rows = conn.execute(
-        "SELECT number, user_id, channel_id, category, status, created_at, closed_at, closed_by, transcript FROM tickets"
+        "SELECT number, user_id, channel_id, ticket_type, status, created_at, "
+        "closed_at, closed_by, transcript, guild_id, approved_by, approved_at, "
+        "rejected_by, rejected_at FROM tickets"
     ).fetchall()
     result = {}
     for r in rows:
         result[str(r[0])] = {
-            "user_id": str(r[1]),
-            "channel_id": str(r[2]),
-            "category": r[3],
+            "user_id": r[1],
+            "channel_id": r[2],
+            "type": r[3],
             "status": r[4],
             "created_at": r[5],
             "closed_at": r[6],
-            "closed_by": str(r[7]) if r[7] else "",
+            "closed_by": r[7],
             "transcript": r[8],
+            "guild_id": r[9],
+            "approved_by": r[10],
+            "approved_at": r[11],
+            "rejected_by": r[12],
+            "rejected_at": r[13],
         }
     return result
 
@@ -193,24 +199,38 @@ def load_tickets():
 def save_tickets(data):
     from database import get_conn
     conn = get_conn()
+    seen = set()
     for num_str, t in data.items():
         if num_str.startswith("_"):
             continue
+        seen.add(int(num_str))
         conn.execute(
             """INSERT OR REPLACE INTO tickets
-               (number, user_id, channel_id, category, status, created_at, closed_at, closed_by, transcript)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (number, user_id, channel_id, ticket_type, status, created_at,
+                closed_at, closed_by, transcript, guild_id, approved_by,
+                approved_at, rejected_by, rejected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(num_str),
                 int(t.get("user_id", 0)),
                 int(t.get("channel_id", 0)),
-                t.get("category", ""),
+                t.get("type", "") or "",
                 t.get("status", "open"),
-                t.get("created_at", ""),
-                t.get("closed_at", ""),
+                t.get("created_at", "") or "",
+                t.get("closed_at", "") or "",
                 int(t.get("closed_by", 0)) if t.get("closed_by") else 0,
-                t.get("transcript", ""),
+                t.get("transcript", "") or "",
+                int(t.get("guild_id", 0)) if t.get("guild_id") else 0,
+                int(t.get("approved_by", 0)) if t.get("approved_by") else 0,
+                t.get("approved_at", "") or "",
+                int(t.get("rejected_by", 0)) if t.get("rejected_by") else 0,
+                t.get("rejected_at", "") or "",
             ),
+        )
+    if seen:
+        conn.execute(
+            f"DELETE FROM tickets WHERE number NOT IN ({','.join('?' for _ in seen)})",
+            tuple(seen),
         )
     conn.commit()
 

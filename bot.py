@@ -208,6 +208,7 @@ bot.tree.add_command(context_remove_vacation)
 
 COGS = [
     "cogs.tickets",
+    "cogs.clan_tickets",
     "cogs.vacations",
     "cogs.events",
     "cogs.music",
@@ -274,6 +275,7 @@ async def on_ready():
         # Register persistent views
         from cogs.tickets import (TicketCreateView, TicketCloseView,
                                    PromotionPanelView, ArmaPanelView, TicketClosedView)
+        from cogs.clan_tickets import ClanTicketPanelView, ClanTicketCloseView, ClanTicketClosedView
         from cogs.vacations import RequestPanelView, LegacyVacationPanelView
         from cogs.roles import RolePanelView
         from cogs.temp_voice import TempChannelView
@@ -281,6 +283,9 @@ async def on_ready():
 
         bot.add_view(RequestPanelView())
         bot.add_view(LegacyVacationPanelView())
+        bot.add_view(ClanTicketPanelView())
+        bot.add_view(ClanTicketCloseView())
+        bot.add_view(ClanTicketClosedView())
         bot.add_view(TicketCreateView())
         bot.add_view(TicketCloseView())
         bot.add_view(PromotionPanelView())

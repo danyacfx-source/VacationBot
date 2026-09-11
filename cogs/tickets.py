@@ -274,11 +274,14 @@ class TicketClosedView(discord.ui.View):
         tickets = load_tickets()
         ticket_data = tickets.get(str(interaction.channel.id))
 
-        if ticket_data and interaction.user.id == ticket_data.get("user_id"):
-            await interaction.followup.send(
-                "❌ Вы не можете управлять этим тикетом."
-            )
-            return
+        if ticket_data:
+            is_owner = interaction.user.id == ticket_data.get("user_id")
+            is_staff = interaction.user.guild_permissions.manage_channels
+            if not is_owner and not is_staff:
+                await interaction.followup.send(
+                    "❌ Вы не можете удалить этот тикет.", ephemeral=True
+                )
+                return
 
         await send_ticket_log(
             interaction.client,

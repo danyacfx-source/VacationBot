@@ -47,6 +47,27 @@ def _ensure_events_columns(conn):
         logging.error("Ошибка расширения схемы events: %s", e)
 
 
+_TICKETS_EXTRA_COLUMNS = [
+    ("ticket_type", "TEXT DEFAULT ''"),
+    ("guild_id", "INTEGER DEFAULT 0"),
+    ("approved_by", "INTEGER DEFAULT 0"),
+    ("approved_at", "TEXT DEFAULT ''"),
+    ("rejected_by", "INTEGER DEFAULT 0"),
+    ("rejected_at", "TEXT DEFAULT ''"),
+]
+
+
+def _ensure_tickets_columns(conn):
+    try:
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(tickets)").fetchall()}
+        for name, ddl in _TICKETS_EXTRA_COLUMNS:
+            if name not in cols:
+                conn.execute(f"ALTER TABLE tickets ADD COLUMN {name} {ddl}")
+        conn.commit()
+    except Exception as e:
+        logging.error("Ошибка расширения схемы tickets: %s", e)
+
+
 def init_db():
     conn = get_conn()
     conn.executescript("""
@@ -82,12 +103,17 @@ def init_db():
             number INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL,
             channel_id INTEGER,
-            category TEXT DEFAULT '',
+            ticket_type TEXT DEFAULT '',
             status TEXT DEFAULT 'open',
             created_at TEXT,
             closed_at TEXT,
             closed_by INTEGER,
-            transcript TEXT DEFAULT ''
+            transcript TEXT DEFAULT '',
+            guild_id INTEGER DEFAULT 0,
+            approved_by INTEGER DEFAULT 0,
+            approved_at TEXT DEFAULT '',
+            rejected_by INTEGER DEFAULT 0,
+            rejected_at TEXT DEFAULT ''
         );
 
         CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets(user_id);
@@ -142,6 +168,7 @@ def init_db():
         );
     """)
     _ensure_events_columns(conn)
+    _ensure_tickets_columns(conn)
     conn.commit()
 
 
@@ -197,18 +224,19 @@ def migrate_json_to_db():
                 continue
             conn.execute(
                 """INSERT OR REPLACE INTO tickets
-                   (number, user_id, channel_id, category, status, created_at, closed_at, closed_by, transcript)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (number, user_id, channel_id, ticket_type, status, created_at, closed_at, closed_by, transcript, guild_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     int(num_str),
                     int(t.get("user_id", 0)),
                     int(t.get("channel_id", 0)),
-                    t.get("category", ""),
+                    t.get("type", "") or t.get("category", ""),
                     t.get("status", "open"),
                     t.get("created_at", ""),
                     t.get("closed_at", ""),
                     int(t.get("closed_by", 0)) if t.get("closed_by") else 0,
                     t.get("transcript", ""),
+                    int(t.get("guild_id", 0)) if t.get("guild_id") else 0,
                 ),
             )
         conn.commit()
