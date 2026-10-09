@@ -451,10 +451,10 @@ class ModerationCog(commands.Cog):
         msg = await interaction.original_response()
         await msg.add_reaction("✅")
 
-        await self.bot.db.execute(
-            "INSERT OR REPLACE INTO giveaways (message_id, prize, host_id, channel_id, end_time, winners_count, ended) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0)",
-            (msg.id, prize, interaction.user.id, interaction.channel_id, end_time.isoformat(), winners),
+        await self.bot.db.insert_replace(
+            "giveaways",
+            ["message_id", "prize", "host_id", "channel_id", "end_time", "winners_count", "ended"],
+            [(msg.id, prize, interaction.user.id, interaction.channel_id, end_time.isoformat(), winners, 0)],
         )
 
     async def check_giveaways(self) -> None:
@@ -553,14 +553,15 @@ class ModerationCog(commands.Cog):
     @app_commands.command(name="afk", description="Пометить себя как AFK")
     @app_commands.describe(reason="Причина")
     async def afk_cmd(self, interaction: discord.Interaction, reason: str = "AFK") -> None:
-        await self.bot.db.execute(
-            "INSERT OR REPLACE INTO afk (user_id, reason, since, display_name) VALUES (?, ?, ?, ?)",
-            (
+        await self.bot.db.insert_replace(
+            "afk",
+            ["user_id", "reason", "since", "display_name"],
+            [(
                 interaction.user.id,
                 reason,
                 msk_utcnow().isoformat(),
                 interaction.user.display_name,
-            ),
+            )],
         )
         await interaction.response.send_message(
             embed=style.info(

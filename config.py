@@ -24,6 +24,7 @@ if DATA_DIR:
 BASE_DIR: Final = os.path.dirname(os.path.abspath(__file__))
 
 TOKEN: Final = os.getenv("DISCORD_BOT_TOKEN", "")
+DATABASE_URL: Final = os.getenv("DATABASE_URL", "").strip()
 GUILD_ID: Final = (
     discord.Object(id=int(os.getenv("GUILD_ID", "0"))) if os.getenv("GUILD_ID") else None
 )
@@ -187,16 +188,9 @@ RAM_REPORT_INTERVAL_MINUTES: Final = 30
 
 # ---------------------------------------------------------------- файлы и лимиты
 
-DB_FILE: Final = "bot_data.db"
-VACATIONS_FILE: Final = "vacations.json"
 BACKUP_FILES: Final = [
     "vacations.json",
-    "events.json",
-    "birthdays.json",
-    "member_stats.json",
-    "warnings.json",
-    "giveaways.json",
-    "afk.json",
+    "data/artillery.json",
 ]
 MAX_VOICE_SESSIONS: Final = 100
 REMINDER_MAX_DAYS: Final = 7

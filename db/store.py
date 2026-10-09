@@ -1,4 +1,4 @@
-"""Типизированные хранилища поверх SQLite.
+"""Типизированные хранилища поверх PostgreSQL.
 
 Каждый стор инкапсулирует SQL для одной предметной области — коги
 работают с объектами, а не с запросами.
@@ -169,14 +169,12 @@ class ReminderStore:
         self._db = db
 
     async def add(self, user_id: int, channel_id: int, fire_at: datetime, message: str) -> int:
-        await self._db.execute(
+        row = await self._db.fetchone(
             "INSERT INTO reminders (user_id, channel_id, fire_at, message, delivered) "
-            "VALUES (?, ?, ?, ?, 0)",
+            "VALUES (?, ?, ?, ?, 0) RETURNING id",
             (user_id, channel_id, fire_at.isoformat(timespec="seconds"), message),
         )
-        return int(
-            await self._db.scalar("SELECT last_insert_rowid()", default=0) or 0
-        )
+        return int((row or {}).get("id") or 0)
 
     async def due(self, now: datetime, limit: int = 20) -> list[dict[str, Any]]:
         return await self._db.fetchall(

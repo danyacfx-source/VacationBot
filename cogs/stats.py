@@ -157,7 +157,7 @@ class StatsCog(commands.Cog):
             (user_id, secs, secs),
         )
         await db.execute(
-            "INSERT INTO voice_sessions (user_id, channel, start, end, seconds) "
+            'INSERT INTO voice_sessions (user_id, channel, start, "end", seconds) '
             "VALUES (?, ?, ?, ?, ?)",
             (user_id, channel, start.isoformat(), now.isoformat(), secs),
         )
@@ -246,7 +246,7 @@ class StatsCog(commands.Cog):
 
     async def _get_voice_sessions(self, user_id: int) -> list[dict]:
         rows = await self.bot.db.fetchall(
-            "SELECT channel, start, end, seconds FROM voice_sessions "
+            "SELECT channel, start, \"end\", seconds FROM voice_sessions "
             "WHERE user_id = ? ORDER BY id DESC",
             (user_id,),
         )

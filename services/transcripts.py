@@ -14,6 +14,7 @@ from typing import Any
 import discord
 
 from db.schema import TICKET_COLUMNS as _TICKET_DDL
+from db.schema import ensure_columns as _ensure_columns
 from ui import style
 
 log = logging.getLogger(__name__)
@@ -59,27 +60,15 @@ def _row_to_ticket(row: dict[str, Any]) -> dict[str, Any]:
 async def ensure_ticket_schema(db) -> None:
     """Добавляет недостающие колонки таблицы tickets (идемпотентно).
 
-    Старые базы могут быть без миграций — один раз сверяем PRAGMA,
-    дальше флаг на самом объекте БД (глобального состояния нет).
+    Проверка одна — дальше флаг на самом объекте БД (глобального состояния нет).
     """
     if getattr(db, "_tickets_schema_ready", False):
         return
 
     try:
-        existing = {row["name"] for row in await db.fetchall("PRAGMA table_info(tickets)")}
+        await _ensure_columns(db, "tickets", _TICKET_DDL)
     except Exception as exc:
-        log.error("Не удалось прочитать схему tickets: %s", exc)
-        setattr(db, "_tickets_schema_ready", True)
-        return
-
-    for name, ddl in _TICKET_DDL:
-        if name in existing:
-            continue
-        try:
-            await db.execute(f"ALTER TABLE tickets ADD COLUMN {name} {ddl}")
-            log.info("Схема: добавлена колонка tickets.%s", name)
-        except Exception as exc:
-            log.error("Не удалось добавить tickets.%s: %s", name, exc)
+        log.error("Не удалось сверить схему tickets: %s", exc)
 
     setattr(db, "_tickets_schema_ready", True)
 
@@ -106,7 +95,7 @@ async def find_open_ticket(bot, user_id: int, ticket_type: str) -> dict[str, Any
 
 
 async def save_ticket(bot, ticket: dict[str, Any]) -> None:
-    """INSERT OR REPLACE одной записи — без перезаписи всей таблицы."""
+    """Upsert одной записи — без перезаписи всей таблицы."""
     number = int(ticket.get("channel_id") or ticket.get("number") or 0)
     if not number:
         raise ValueError("save_ticket: у тикета не указан channel_id")
@@ -120,11 +109,7 @@ async def save_ticket(bot, ticket: dict[str, Any]) -> None:
             value = _DEFAULTS[key]
         params.append(_coerce(cast, value))
 
-    placeholders = ", ".join("?" * len(columns))
-    await bot.db.execute(
-        f"INSERT OR REPLACE INTO tickets ({', '.join(columns)}) VALUES ({placeholders})",
-        params,
-    )
+    await bot.db.insert_replace("tickets", columns, [params])
 
 
 async def update_ticket(bot, channel_id: int, **fields: Any) -> None:

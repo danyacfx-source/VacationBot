@@ -27,7 +27,7 @@ from core import errors as core_errors
 from core.app import VacationBot
 from core.log import install_discord_handler, setup_logging
 from db import Database, init_schema
-from db.migrate import migrate_legacy
+from db.migrate import import_from_sqlite, migrate_legacy
 from services.http import http
 from services.notify import send_log, send_startup_log, send_vacation_log
 from services.vacation import refresh_panels
@@ -36,8 +36,8 @@ setup_logging()
 log = logging.getLogger("bot")
 
 BOT_STATE_FILE = "bot_state.json"
-# Путь относительный: config.DATA_DIR меняет cwd — данные должны ехать за ним.
-DB_PATH = "bot_data.db"
+# Старый SQLite-архив: путь относительный, config.DATA_DIR меняет cwd.
+SQLITE_ARCHIVE = "bot_data.db"
 
 COGS = [
     "cogs.tickets",
@@ -357,12 +357,21 @@ async def _ensure_global_ping(bot: VacationBot) -> None:
 
 async def _bootstrap(bot: VacationBot) -> None:
     db = bot.db
+    if not config.DATABASE_URL:
+        log.error("DATABASE_URL не задан в .env")
+        raise SystemExit(1)
+
     db.connect()
     await init_schema(db)
+
+    imported = await asyncio.to_thread(import_from_sqlite, config.DATABASE_URL, SQLITE_ARCHIVE)
+    if imported:
+        log.info("Перенос из SQLite: %s", imported)
+
     migrated = await migrate_legacy(db)
     if migrated:
         log.info("Миграция старых данных: %d записей", migrated)
-    log.info("База данных готова: %s", DB_PATH)
+    log.info("База данных готова: PostgreSQL")
 
     try:
         async with bot:
@@ -423,7 +432,7 @@ def main() -> None:
     while True:
         had_error = False
         try:
-            asyncio.run(_bootstrap(build_bot(Database(DB_PATH))))
+            asyncio.run(_bootstrap(build_bot(Database(config.DATABASE_URL))))
         except KeyboardInterrupt:
             _save_bot_state(True)
             break

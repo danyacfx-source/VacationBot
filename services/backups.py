@@ -1,4 +1,4 @@
-"""Ежедневный бэкап: SQLite + JSON в ZIP, отправка в Discord.
+"""Ежедневный бэкап: дамп PostgreSQL + JSON в ZIP, отправка в Discord.
 
 Архивация выполняется в отдельном потоке — event loop не замирает.
 """
@@ -20,13 +20,13 @@ from db import Database
 log = logging.getLogger(__name__)
 
 
-def _pack(zip_path: Path, db_backup: Path) -> list[str]:
+def _pack(zip_path: Path, db_dump: Path) -> list[str]:
     """Синхронная упаковка файлов (вызывается в executor'е)."""
     packed: list[str] = []
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        if db_backup.exists():
-            archive.write(db_backup, "bot_data.db")
-            packed.append("bot_data.db")
+        if db_dump.exists():
+            archive.write(db_dump, "bot_data.sql")
+            packed.append("bot_data.sql")
         for filename in config.BACKUP_FILES:
             path = Path(filename)
             if path.exists():
@@ -42,22 +42,22 @@ async def run_backup(db: Database) -> tuple[Path | None, list[str]]:
 
 async def _run_backup_inner(db: Database, date_str: str) -> tuple[Path | None, list[str]]:
     zip_path = Path(f"backup_{date_str}.zip")
-    db_backup = Path("bot_data_backup.db")
+    db_dump = Path("bot_data_backup.sql")
 
     loop = asyncio.get_running_loop()
     try:
-        await db.backup(db_backup)
-        packed = await loop.run_in_executor(None, _pack, zip_path, db_backup)
+        await db.backup(db_dump)
+        packed = await loop.run_in_executor(None, _pack, zip_path, db_dump)
     except Exception as exc:
         log.error("Ошибка бэкапа: %s", exc, exc_info=True)
         return None, []
-
-    for temp in (db_backup,):
+    finally:
         try:
-            if temp.exists():
-                os.remove(temp)
+            if db_dump.exists():
+                os.remove(db_dump)
         except OSError:
             pass
+
     return zip_path, packed
 
 

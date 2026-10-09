@@ -56,10 +56,7 @@ async def _migrate_simple(
     if not rows:
         _retire(filename)
         return 0
-    placeholders = ", ".join("?" for _ in columns)
-    await db.executemany(
-        f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({placeholders})", rows
-    )
+    await db.insert_replace(table, columns, rows)
     _retire(filename)
     log.info("Миграция: %s -> %s (%d записей)", filename, table, len(rows))
     return len(rows)
@@ -176,15 +173,15 @@ async def _migrate_member_stats(db: Database) -> int:
 
     count = 0
     if stats_rows:
-        await db.executemany(
-            "INSERT OR REPLACE INTO member_stats "
-            "(user_id, messages, voice_seconds, voice_joins) VALUES (?, ?, ?, ?)",
+        await db.insert_replace(
+            "member_stats",
+            ["user_id", "messages", "voice_seconds", "voice_joins"],
             stats_rows,
         )
         count += len(stats_rows)
     if session_rows:
         await db.executemany(
-            "INSERT INTO voice_sessions (user_id, channel, start, end, seconds) "
+            'INSERT INTO voice_sessions (user_id, channel, start, "end", seconds) '
             "VALUES (?, ?, ?, ?, ?)",
             session_rows,
         )
@@ -200,7 +197,28 @@ async def _migrate_events(db: Database) -> int:
     if not data:
         return 0
 
-    count = 0
+    event_columns = [
+        "id",
+        "name",
+        "start",
+        "briefing",
+        "description",
+        "host_id",
+        "creator_id",
+        "going_inf",
+        "going_tech",
+        "maybe",
+        "sl",
+        "camera",
+        "not_going",
+        "show_not_going",
+        "required",
+        "channel_id",
+        "image_url",
+        "event_type",
+        "location",
+    ]
+    rows: list[Row] = []
     for event_id, event in data.items():
         if event_id.startswith("_") or not str(event_id).isdigit() or not isinstance(event, dict):
             continue
@@ -213,12 +231,7 @@ async def _migrate_events(db: Database) -> int:
             f"{event.get('date', '')} {event.get('time', '')}".strip()
         )
 
-        await db.execute(
-            """INSERT OR REPLACE INTO events
-               (id, name, start, briefing, description, host_id, creator_id,
-                going_inf, going_tech, maybe, sl, camera, not_going,
-                show_not_going, required, channel_id, image_url, event_type, location)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows.append(
             (
                 int(event_id),
                 str(event.get("name", "")),
@@ -239,9 +252,12 @@ async def _migrate_events(db: Database) -> int:
                 str(event.get("image_url", "") or ""),
                 str(event.get("event_type", "freeform") or "freeform"),
                 str(event.get("location", "") or ""),
-            ),
+            )
         )
-        count += 1
+
+    count = 0
+    if rows:
+        count = await db.insert_replace("events", event_columns, rows)
 
     _retire("events.json")
     log.info("Миграция: events.json -> events (%d записей)", count)
@@ -360,4 +376,106 @@ async def migrate_legacy(db: Database) -> int:
     return total
 
 
-__all__ = ["migrate_legacy", "migrate_vacations"]
+def import_from_sqlite(dsn: str, sqlite_path: str) -> dict[str, int]:
+    """Перенос данных из старого bot_data.db в PostgreSQL (один раз).
+
+    Идемпотентно: переносятся только таблицы с полным совпадением названия,
+    которые в PostgreSQL пока пусты. Исходный файл остаётся архивом.
+    Возвращает {таблица: перенесено строк}; отрицательное значение — ошибка.
+    """
+    if not os.path.exists(sqlite_path):
+        return {}
+
+    import sqlite3
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    from .database import mask_dsn
+
+    counts: dict[str, int] = {}
+    src = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    dst = psycopg.connect(dsn, autocommit=True, connect_timeout=15, row_factory=dict_row)
+    try:
+        src_tables = {
+            row[0]
+            for row in src.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        dst_tables = {
+            row["tablename"]
+            for row in dst.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ).fetchall()
+        }
+
+        for table in sorted(src_tables & dst_tables):
+            has_data = dst.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is not None
+            if has_data:
+                continue
+
+            src_cols = [row[1] for row in src.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            dst_rows = dst.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = %s",
+                (table,),
+            ).fetchall()
+            dst_cols = [row["column_name"] for row in dst_rows]
+            columns = [c for c in dst_cols if c in set(src_cols)]
+            if not columns:
+                continue
+
+            rows = src.execute(
+                f'SELECT {", ".join(chr(34) + c + chr(34) for c in columns)} FROM "{table}"'
+            ).fetchall()
+            if not rows:
+                continue
+
+            query = (
+                f'INSERT INTO "{table}" ({", ".join(chr(34) + c + chr(34) for c in columns)}) '
+                f"VALUES ({', '.join(['%s'] * len(columns))}) ON CONFLICT DO NOTHING"
+            )
+            try:
+                with dst.transaction():
+                    with dst.cursor() as cur:
+                        cur.executemany(query, rows)
+            except Exception as exc:
+                log.error("Перенос %s не удался: %s", table, exc)
+                counts[table] = -1
+                continue
+
+            counts[table] = len(rows)
+            _bump_sequences(dst, table, dst_cols)
+            log.info("Перенос SQLite: %s -> %s (%d строк)", sqlite_path, table, len(rows))
+
+        if counts:
+            log.info("SQLite: файл %s сохранён как архив", sqlite_path)
+    finally:
+        src.close()
+        dst.close()
+    return counts
+
+
+def _bump_sequences(dst, table: str, columns: list[str]) -> None:
+    """Подгоняет identity-последовательности под уже вставленные id."""
+    identity = dst.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s AND is_identity = 'YES'",
+        (table,),
+    ).fetchall()
+    for row in identity:
+        column = row["column_name"]
+        if column not in columns:
+            continue
+        peak = dst.execute(
+            f'SELECT COALESCE(MAX("{column}"), 0) FROM "{table}"'
+        ).fetchone()
+        value = int(next(iter(peak.values())) or 0)
+        dst.execute(
+            "SELECT setval(pg_get_serial_sequence(%s, %s), %s, %s)",
+            (table, column, max(value, 1), value > 0),
+        )
+
+
+__all__ = ["migrate_legacy", "migrate_vacations", "import_from_sqlite"]
