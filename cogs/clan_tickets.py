@@ -1,19 +1,27 @@
-import sys
-import os
+"""Заявки в клан: панель, создание, закрытие, транскрипт (без approve/reject)."""
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from __future__ import annotations
 
 import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime
-from io import BytesIO
 
-from helpers import send_ticket_log, load_tickets, save_tickets
 import config
+from core.timeutil import msk_utcnow
+from services.notify import _send as _notify_send
+from services.transcripts import (
+    delete_ticket,
+    fetch_ticket,
+    find_open_ticket,
+    save_ticket,
+    send_transcript,
+    update_ticket,
+)
+from ui import style
 
-log = logging.getLogger("clan_tickets")
+log = logging.getLogger(__name__)
 
 CLAN_APPLICATION_FORM = (
     "**Пожалуйста, ответьте на вопросы:**\n\n"
@@ -32,10 +40,21 @@ CLAN_PANEL_DESCRIPTION = (
     "🤝 Взаимный опыт\n"
     "😊 Приятная атмосфера\n"
     "🎮 Помощь в освоении механик игры\n\n"
-    "💎 P.S. В будущем будет VIP на сервера, которые приглянутся"
+    "💎 P.S. В будущем будет VIP на сервера, которые приглядутся"
 )
 
 CLAN_TICKET_TYPE = "clan"
+
+
+async def _clan_log(bot, title: str, description: str, color: discord.Color | None = None) -> None:
+    """Клановый тикет-лог идёт в свой канал (см. config.CLAN_TICKET_LOG_CHANNEL)."""
+    await _notify_send(
+        bot,
+        config.CLAN_TICKET_LOG_CHANNEL,
+        title,
+        description,
+        color or discord.Color.blue(),
+    )
 
 
 class ClanTicketPanelView(discord.ui.View):
@@ -50,23 +69,25 @@ class ClanTicketPanelView(discord.ui.View):
 
     async def _create_ticket(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        bot = interaction.client
 
-        tickets = load_tickets()
-        for t in tickets.values():
-            if (
-                t.get("user_id") == interaction.user.id
-                and t.get("status") == "open"
-                and t.get("type") == CLAN_TICKET_TYPE
-            ):
-                return await interaction.followup.send(
-                    "У вас уже есть открытая заявка в клан.", ephemeral=True
-                )
+        if await find_open_ticket(bot, interaction.user.id, CLAN_TICKET_TYPE):
+            return await interaction.followup.send(
+                embed=style.warning(
+                    "⏳ Заявка уже открыта",
+                    "У вас уже есть открытая заявка в клан.",
+                ),
+                ephemeral=True,
+            )
 
         guild = interaction.guild
         user = interaction.user
         category = guild.get_channel(config.TICKET_CATEGORY)
         if not category:
-            return await interaction.followup.send("❌ Категория тикетов не настроена.", ephemeral=True)
+            return await interaction.followup.send(
+                embed=style.error("Ошибка", "❌ Категория тикетов не настроена."),
+                ephemeral=True,
+            )
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -91,41 +112,54 @@ class ClanTicketPanelView(discord.ui.View):
         except discord.HTTPException as e:
             log.warning("Ошибка создания кланового тикета для %s: %s", user, e)
             return await interaction.followup.send(
-                "❌ Не удалось создать заявку (ошибка Discord).", ephemeral=True
+                embed=style.error("Ошибка", "❌ Не удалось создать заявку (ошибка Discord)."),
+                ephemeral=True,
             )
         except Exception as e:
             log.exception("Непредвиденная ошибка создания кланового тикета: %s", e)
             return await interaction.followup.send(
-                "❌ Не удалось создать заявку.", ephemeral=True
+                embed=style.error("Ошибка", "❌ Не удалось создать заявку."),
+                ephemeral=True,
             )
 
-        embed = discord.Embed(
-            title="📝 ЗАЯВКА В КЛАН",
-            description=CLAN_APPLICATION_FORM,
+        embed = style.base(
+            "📝 ЗАЯВКА В КЛАН",
+            CLAN_APPLICATION_FORM,
             color=discord.Color.gold(),
-            timestamp=datetime.utcnow(),
+            footer=f"ID: {user.id}",
+            timestamp=True,
         )
         embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
-        embed.set_footer(text=f"ID: {user.id}")
 
         staff_mention = f"<@&{config.TICKET_STAFF_ROLE}>"
-        await channel.send(content=f"{staff_mention} {user.mention}", embed=embed, view=ClanTicketCloseView())
+        try:
+            await channel.send(
+                content=f"{staff_mention} {user.mention}",
+                embed=embed,
+                view=ClanTicketCloseView(),
+            )
+        except discord.HTTPException as exc:
+            log.error("Не удалось отправить сообщение в заявку %s: %s", channel.name, exc)
 
-        ticket_id = str(channel.id)
-        tickets[ticket_id] = {
-            "user_id": user.id,
-            "channel_id": channel.id,
-            "type": CLAN_TICKET_TYPE,
-            "status": "open",
-            "created_at": datetime.utcnow().isoformat(),
-            "guild_id": guild.id,
-        }
-        save_tickets(tickets)
+        await save_ticket(
+            bot,
+            {
+                "user_id": user.id,
+                "channel_id": channel.id,
+                "type": CLAN_TICKET_TYPE,
+                "status": "open",
+                "created_at": msk_utcnow().isoformat(timespec="seconds"),
+                "guild_id": guild.id,
+            },
+        )
 
-        await interaction.followup.send(f"Заявка в клан создана: {channel.mention}", ephemeral=True)
+        await interaction.followup.send(
+            embed=style.success("📝 Заявка в клан", f"Заявка в клан создана: {channel.mention}"),
+            ephemeral=True,
+        )
 
-        await send_ticket_log(
-            interaction.client,
+        await _clan_log(
+            bot,
             "📝 Заявка в клан",
             f"**Тикет:** {channel.mention}\n**Пользователь:** {user}",
         )
@@ -140,43 +174,62 @@ class ClanTicketCloseConfirmView(discord.ui.View):
         await interaction.response.defer()
 
         channel = interaction.channel
-        tickets = load_tickets()
-        ticket_data = tickets.get(str(channel.id))
+        bot = interaction.client
+        ticket_data = await fetch_ticket(bot, channel.id)
 
         if ticket_data:
-            ticket_data["status"] = "closed"
-            ticket_data["closed_at"] = datetime.utcnow().isoformat()
-            ticket_data["closed_by"] = interaction.user.id
-            save_tickets(tickets)
+            await update_ticket(
+                bot,
+                channel.id,
+                status="closed",
+                closed_at=msk_utcnow().isoformat(timespec="seconds"),
+                closed_by=interaction.user.id,
+            )
 
             creator_id = ticket_data.get("user_id")
             if creator_id:
                 member = channel.guild.get_member(int(creator_id))
                 if member:
-                    await channel.set_permissions(member, overwrite=None)
-            await channel.set_permissions(channel.guild.default_role, view_channel=False)
-            staff_role = channel.guild.get_role(config.TICKET_STAFF_ROLE)
-            if staff_role:
-                await channel.set_permissions(
-                    staff_role, view_channel=True, send_messages=False, read_message_history=True
-                )
+                    try:
+                        await channel.set_permissions(member, overwrite=None)
+                    except discord.HTTPException as exc:
+                        log.error("Не удалось снять права %s в заявке: %s", member, exc)
 
-        embed = discord.Embed(
-            title="Заявка закрыта",
-            description=f"Закрыл: {interaction.user.mention}\nСохраните транскрипт или удалите канал.",
-            color=discord.Color.greyple(),
+            staff_role = channel.guild.get_role(config.TICKET_STAFF_ROLE)
+            try:
+                await channel.set_permissions(
+                    channel.guild.default_role, view_channel=False
+                )
+                if staff_role:
+                    await channel.set_permissions(
+                        staff_role,
+                        view_channel=True,
+                        send_messages=False,
+                        read_message_history=True,
+                    )
+            except discord.HTTPException as exc:
+                log.error("Не удалось обновить права заявки %s: %s", channel.name, exc)
+
+        embed = style.base(
+            "Заявка закрыта",
+            f"Закрыл: {interaction.user.mention}\nСохраните транскрипт или удалите канал.",
+            color=style.NEUTRAL,
+            footer=None,
         )
         await interaction.message.edit(embed=embed, view=ClanTicketClosedView())
 
-        await send_ticket_log(
-            interaction.client,
+        await _clan_log(
+            bot,
             "📝 Заявка в клан закрыта",
             f"**Тикет:** {channel.mention}\n**Закрыл:** {interaction.user}",
         )
 
     @discord.ui.button(label="Нет", style=discord.ButtonStyle.red, emoji="❌")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Закрытие отменено.", view=None)
+        await interaction.response.edit_message(
+            embed=style.info("Отменено", "Закрытие отменено."),
+            view=None,
+        )
 
 
 class ClanTicketCloseView(discord.ui.View):
@@ -186,7 +239,8 @@ class ClanTicketCloseView(discord.ui.View):
     @discord.ui.button(label="Закрыть заявку", style=discord.ButtonStyle.red, custom_id="ck_close", emoji="🔒")
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "Вы уверены?", view=ClanTicketCloseConfirmView()
+            embed=style.warning("🔒 Закрытие заявки", "Вы уверены?"),
+            view=ClanTicketCloseConfirmView(),
         )
 
 
@@ -198,57 +252,51 @@ class ClanTicketClosedView(discord.ui.View):
     async def delete_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
 
-        tickets = load_tickets()
-        ticket_data = tickets.get(str(interaction.channel.id))
+        bot = interaction.client
+        ticket_data = await fetch_ticket(bot, interaction.channel.id)
 
         if ticket_data:
             is_owner = interaction.user.id == ticket_data.get("user_id")
             is_staff = interaction.user.guild_permissions.manage_channels
             if not is_owner and not is_staff:
                 return await interaction.followup.send(
-                    "❌ Вы не можете удалить этот тикет.", ephemeral=True
+                    embed=style.error("Нет доступа", "❌ Вы не можете удалить этот тикет."),
+                    ephemeral=True,
                 )
 
-        tickets.pop(str(interaction.channel.id), None)
-        save_tickets(tickets)
+        await delete_ticket(bot, interaction.channel.id)
 
-        await send_ticket_log(
-            interaction.client,
+        await _clan_log(
+            bot,
             "🗑️ Клановый тикет удалён",
             f"**Канал:** {interaction.channel.name}\n**Удалил:** {interaction.user}",
         )
 
-        await interaction.channel.delete()
+        try:
+            await interaction.channel.delete()
+        except discord.HTTPException as exc:
+            log.error(
+                "Не удалось удалить канал кланового тикета %s: %s",
+                interaction.channel.name,
+                exc,
+            )
+            await interaction.followup.send(
+                embed=style.error("Ошибка", "Не удалось удалить канал."),
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="Сохранить транскрипт", style=discord.ButtonStyle.blurple, custom_id="ck_transcript", emoji="📄")
     async def save_transcript(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
 
-        channel = interaction.channel
-        messages = [message async for message in channel.history(oldest_first=True)]
-
-        lines = []
-        for msg in messages:
-            ts = msg.created_at.strftime("%d.%m.%Y %H:%M:%S")
-            content = msg.content or ""
-            if msg.embeds:
-                for e in msg.embeds:
-                    if e.description:
-                        content += f" {e.description}"
-            lines.append(f"[{ts}] {msg.author}: {content}")
-
-        transcript = "\n".join(lines)
-        file = discord.File(
-            fp=BytesIO(transcript.encode("utf-8")),
-            filename=f"clan-{channel.name}.txt",
+        await send_transcript(
+            interaction,
+            prefix="clan",
+            transcript_channel_id=config.TICKET_TRANSCRIPT_CHANNEL,
+            message_fields=False,
+            fallback_file=True,
+            ephemeral=True,
         )
-
-        if config.TICKET_TRANSCRIPT_CHANNEL:
-            tr_ch = interaction.guild.get_channel(config.TICKET_TRANSCRIPT_CHANNEL)
-            if tr_ch:
-                await tr_ch.send(file=file)
-                return await interaction.followup.send("Транскрипт сохранён.", ephemeral=True)
-        await interaction.followup.send(file=file, ephemeral=True)
 
 
 class ClanTicketCog(commands.Cog):
@@ -261,20 +309,26 @@ class ClanTicketCog(commands.Cog):
     @app_commands.describe(channel="Канал для панели")
     @app_commands.guild_only()
     async def clan_panel(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+        if not style.is_admin(interaction):
+            return await interaction.response.send_message(
+                embed=style.error("Нет прав", "❌ Нет прав."),
+                ephemeral=True,
+            )
 
         await interaction.response.defer(ephemeral=True)
         target = channel or interaction.channel
 
-        embed = discord.Embed(
-            title="⚔️ ЗАЯВКА В КЛАН",
-            description=CLAN_PANEL_DESCRIPTION,
+        embed = style.base(
+            "⚔️ ЗАЯВКА В КЛАН",
+            CLAN_PANEL_DESCRIPTION,
             color=discord.Color.gold(),
+            footer="Нажмите кнопку ниже, чтобы подать заявку.",
         )
-        embed.set_footer(text="Нажмите кнопку ниже, чтобы подать заявку.")
         await target.send(embed=embed, view=ClanTicketPanelView())
-        await interaction.followup.send(f"Панель отправлена в {target.mention}.", ephemeral=True)
+        await interaction.followup.send(
+            embed=style.success("✅ Панель", f"Панель отправлена в {target.mention}."),
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot):

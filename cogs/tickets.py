@@ -1,14 +1,27 @@
-import sys
-import os
-import discord
-from discord.ext import commands
-from discord import app_commands
-from io import BytesIO
-from datetime import datetime
+"""Система тикетов: панели заявок, создание, закрытие, транскрипт, approve/reject."""
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from helpers import send_ticket_log, load_tickets, save_tickets
+from __future__ import annotations
+
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
 import config
+from core.timeutil import msk_utcnow
+from services.notify import send_ticket_log
+from services.transcripts import (
+    delete_ticket,
+    fetch_ticket,
+    find_open_ticket,
+    save_ticket,
+    send_transcript,
+    update_ticket,
+)
+from ui import style
+
+log = logging.getLogger(__name__)
 
 
 class TicketCreateView(discord.ui.View):
@@ -33,19 +46,17 @@ class TicketCreateView(discord.ui.View):
 
     async def _create_ticket(self, interaction: discord.Interaction, ticket_type: str):
         await interaction.response.defer(ephemeral=True)
+        bot = interaction.client
 
-        tickets = load_tickets()
-
-        for t in tickets.values():
-            if (
-                t.get("user_id") == interaction.user.id
-                and t.get("status") == "open"
-                and t.get("type") == ticket_type
-            ):
-                await interaction.followup.send(
-                    "У вас уже есть открытый тикет этого типа.", ephemeral=True
-                )
-                return
+        if await find_open_ticket(bot, interaction.user.id, ticket_type):
+            await interaction.followup.send(
+                embed=style.warning(
+                    "⏳ Тикет уже открыт",
+                    "У вас уже есть открытый тикет этого типа.",
+                ),
+                ephemeral=True,
+            )
+            return
 
         user = interaction.user
         guild = interaction.guild
@@ -126,55 +137,78 @@ class TicketCreateView(discord.ui.View):
                 attach_files=True,
                 embed_links=True,
             ),
-            guild.get_role(config.TICKET_STAFF_ROLE): discord.PermissionOverwrite(
+        }
+        staff_role = guild.get_role(config.TICKET_STAFF_ROLE)
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
                 read_message_history=True,
-            ),
-        }
+            )
 
         channel_name = f"{cfg['prefix']}-{user.name}"
-        channel = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            topic=f"Тикет от {user} ({user.id}) | Тип: {ticket_type}",
-        )
+        try:
+            channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                topic=f"Тикет от {user} ({user.id}) | Тип: {ticket_type}",
+            )
+        except discord.HTTPException as exc:
+            log.error("Не удалось создать тикет %s для %s: %s", ticket_type, user, exc)
+            await interaction.followup.send(
+                embed=style.error("Ошибка", "Не удалось создать тикет (ошибка Discord)."),
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            log.exception("Непредвиденная ошибка создания тикета %s", ticket_type)
+            await interaction.followup.send(
+                embed=style.error("Ошибка", "Не удалось создать тикет."),
+                ephemeral=True,
+            )
+            return
 
-        embed = discord.Embed(
-            title=cfg["title"],
-            description=cfg["question"],
+        embed = style.base(
+            cfg["title"],
+            cfg["question"],
             color=cfg["color"],
-            timestamp=datetime.utcnow(),
+            footer=f"ID: {user.id}",
+            timestamp=True,
         )
         embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
-        embed.set_footer(text=f"ID: {user.id}")
 
-        await channel.send(
-            content=f"<@&1509699660149821601> <@&1484506106897109125> {user.mention}",
-            embed=embed,
-            view=TicketCloseView(),
+        pings = " ".join(f"<@&{role_id}>" for role_id in config.TICKET_NOTIFY_ROLES)
+        try:
+            await channel.send(
+                content=f"{pings} {user.mention}".strip(),
+                embed=embed,
+                view=TicketCloseView(),
+            )
+        except discord.HTTPException as exc:
+            log.error("Не удалось отправить сообщение в тикет %s: %s", channel.name, exc)
+
+        await save_ticket(
+            bot,
+            {
+                "user_id": user.id,
+                "channel_id": channel.id,
+                "type": ticket_type,
+                "status": "open",
+                "created_at": msk_utcnow().isoformat(timespec="seconds"),
+                "guild_id": guild.id,
+            },
         )
 
-        ticket_id = str(channel.id)
-        tickets[ticket_id] = {
-            "user_id": user.id,
-            "channel_id": channel.id,
-            "type": ticket_type,
-            "status": "open",
-            "created_at": datetime.utcnow().isoformat(),
-            "guild_id": guild.id,
-        }
-        save_tickets(tickets)
-
         await send_ticket_log(
-            interaction.client,
+            bot,
             "🎫 Тикет создан",
             f"**Тикет:** {channel.mention}\n**Тип:** {ticket_type}\n**Пользователь:** {user}",
         )
 
         await interaction.followup.send(
-            f"Тикет создан: {channel.mention}", ephemeral=True
+            embed=style.success("🎫 Тикет создан", f"Тикет создан: {channel.mention}"),
+            ephemeral=True,
         )
 
 
@@ -189,41 +223,51 @@ class TicketCloseConfirmView(discord.ui.View):
         await interaction.response.defer()
 
         channel = interaction.channel
-        tickets = load_tickets()
-        ticket_data = tickets.get(str(channel.id))
+        bot = interaction.client
+        ticket_data = await fetch_ticket(bot, channel.id)
 
         if ticket_data:
-            ticket_data["status"] = "closed"
-            ticket_data["closed_at"] = datetime.utcnow().isoformat()
-            ticket_data["closed_by"] = interaction.user.id
-            save_tickets(tickets)
+            await update_ticket(
+                bot,
+                channel.id,
+                status="closed",
+                closed_at=msk_utcnow().isoformat(timespec="seconds"),
+                closed_by=interaction.user.id,
+            )
 
             creator_id = ticket_data.get("user_id")
             if creator_id:
                 member = channel.guild.get_member(int(creator_id))
                 if member:
-                    await channel.set_permissions(member, overwrite=None)
-            staff_role = channel.guild.get_role(config.TICKET_STAFF_ROLE)
-            if staff_role:
-                await channel.set_permissions(
-                    channel.guild.default_role, overwrite=None,
-                )
-                await channel.set_permissions(
-                    staff_role,
-                    view_channel=True,
-                    read_message_history=True,
-                )
+                    try:
+                        await channel.set_permissions(member, overwrite=None)
+                    except discord.HTTPException as exc:
+                        log.error("Не удалось снять права %s в тикете: %s", member, exc)
 
-        embed = discord.Embed(
-            title="Тикет закрыт",
-            description=f"Тикет закрыт модератором {interaction.user.mention}.\n\nВы можете сохранить транскрипт или удалить канал.",
-            color=discord.Color.greyple(),
+            staff_role = channel.guild.get_role(config.TICKET_STAFF_ROLE)
+            try:
+                await channel.set_permissions(channel.guild.default_role, overwrite=None)
+                if staff_role:
+                    await channel.set_permissions(
+                        staff_role,
+                        view_channel=True,
+                        read_message_history=True,
+                    )
+            except discord.HTTPException as exc:
+                log.error("Не удалось обновить права тикета %s: %s", channel.name, exc)
+
+        embed = style.base(
+            "Тикет закрыт",
+            f"Тикет закрыт модератором {interaction.user.mention}.\n\n"
+            "Вы можете сохранить транскрипт или удалить канал.",
+            color=style.NEUTRAL,
+            footer=None,
         )
 
         await interaction.edit_original_response(embed=embed, view=TicketClosedView())
 
         await send_ticket_log(
-            interaction.client,
+            bot,
             "🎫 Тикет закрыт",
             f"**Тикет:** {channel.mention}\n**Закрыл:** {interaction.user}",
         )
@@ -233,7 +277,8 @@ class TicketCloseConfirmView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await interaction.response.edit_message(
-            content="Закрытие отменено.", view=None
+            embed=style.info("Отменено", "Закрытие отменено."),
+            view=None,
         )
 
 
@@ -251,7 +296,10 @@ class TicketCloseView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await interaction.response.send_message(
-            "Вы уверены, что хотите закрыть тикет?",
+            embed=style.warning(
+                "🔒 Закрытие тикета",
+                "Вы уверены, что хотите закрыть тикет?",
+            ),
             view=TicketCloseConfirmView(),
         )
 
@@ -271,28 +319,35 @@ class TicketClosedView(discord.ui.View):
     ):
         await interaction.response.defer()
 
-        tickets = load_tickets()
-        ticket_data = tickets.get(str(interaction.channel.id))
+        bot = interaction.client
+        ticket_data = await fetch_ticket(bot, interaction.channel.id)
 
         if ticket_data:
             is_owner = interaction.user.id == ticket_data.get("user_id")
             is_staff = interaction.user.guild_permissions.manage_channels
             if not is_owner and not is_staff:
                 await interaction.followup.send(
-                    "❌ Вы не можете удалить этот тикет.", ephemeral=True
+                    embed=style.error("Нет доступа", "❌ Вы не можете удалить этот тикет."),
+                    ephemeral=True,
                 )
                 return
 
         await send_ticket_log(
-            interaction.client,
+            bot,
             "🗑️ Канал тикета удалён",
             f"**Канал:** {interaction.channel.name}\n**Удалил:** {interaction.user}",
         )
 
-        tickets.pop(str(interaction.channel.id), None)
-        save_tickets(tickets)
+        await delete_ticket(bot, interaction.channel.id)
 
-        await interaction.channel.delete()
+        try:
+            await interaction.channel.delete()
+        except discord.HTTPException as exc:
+            log.error("Не удалось удалить канал тикета %s: %s", interaction.channel.name, exc)
+            await interaction.followup.send(
+                embed=style.error("Ошибка", "Не удалось удалить канал."),
+                ephemeral=True,
+            )
 
     @discord.ui.button(
         label="Сохранить транскрипт",
@@ -305,50 +360,14 @@ class TicketClosedView(discord.ui.View):
     ):
         await interaction.response.defer()
 
-        channel = interaction.channel
-        messages = [message async for message in channel.history(oldest_first=True)]
-
-        lines = []
-        for msg in messages:
-            timestamp = msg.created_at.strftime("%d.%m.%Y %H:%M:%S")
-            content = msg.content or ""
-            if msg.embeds:
-                for embed in msg.embeds:
-                    if embed.description:
-                        content += f" {embed.description}"
-                    if embed.fields:
-                        for field in embed.fields:
-                            content += f"\n**{field.name}**: {field.value}"
-            lines.append(f"[{timestamp}] {msg.author}: {content}")
-
-        transcript_text = "\n".join(lines)
-        file = discord.File(
-            fp=BytesIO(transcript_text.encode("utf-8")),
-            filename=f"transcript-{channel.name}.txt",
+        await send_transcript(
+            interaction,
+            prefix="transcript",
+            transcript_channel_id=config.TICKET_TRANSCRIPT_CHANNEL,
+            message_fields=True,
+            meta_fields=True,
+            ephemeral=False,
         )
-
-        transcript_channel = interaction.guild.get_channel(
-            config.TICKET_TRANSCRIPT_CHANNEL
-        )
-        if transcript_channel:
-            embed = discord.Embed(
-                title=f"Транскрипт: {channel.name}",
-                color=discord.Color.greyple(),
-                timestamp=datetime.utcnow(),
-            )
-            embed.set_footer(text=f"Канал: {channel.name} | Сохранил: {interaction.user}")
-
-            tickets = load_tickets()
-            ticket_data = tickets.get(str(channel.id))
-            if ticket_data:
-                user_id = ticket_data.get("user_id")
-                embed.add_field(name="Пользователь", value=f"<@{user_id}>", inline=True)
-                embed.add_field(name="Тип", value=ticket_data.get("type", "unknown"), inline=True)
-                embed.add_field(name="Статус", value=ticket_data.get("status", "unknown"), inline=True)
-
-            await transcript_channel.send(embed=embed, file=file)
-
-        await interaction.followup.send("Транскрипт сохранён.")
 
     @discord.ui.button(
         label="Одобрить",
@@ -361,17 +380,19 @@ class TicketClosedView(discord.ui.View):
     ):
         await interaction.response.defer()
 
-        tickets = load_tickets()
-        ticket_data = tickets.get(str(interaction.channel.id))
+        bot = interaction.client
+        ticket_data = await fetch_ticket(bot, interaction.channel.id)
 
         if not ticket_data:
-            await interaction.followup.send("Данные тикета не найдены.")
+            await interaction.followup.send(
+                embed=style.error("Ошибка", "Данные тикета не найдены.")
+            )
             return
 
         user_id = ticket_data.get("user_id")
         ticket_type = ticket_data.get("type")
         guild = interaction.guild
-        member = guild.get_member(user_id)
+        member = guild.get_member(int(user_id)) if user_id else None
 
         role_map = {
             "academy": getattr(config, "ACADEMY_ROLES", []),
@@ -385,32 +406,48 @@ class TicketClosedView(discord.ui.View):
             for role_id in roles_to_add:
                 role = guild.get_role(role_id)
                 if role:
-                    await member.add_roles(role, reason=f"Тикет одобрен: {interaction.channel.name}")
+                    try:
+                        await member.add_roles(
+                            role,
+                            reason=f"Тикет одобрен: {interaction.channel.name}",
+                        )
+                    except discord.HTTPException as exc:
+                        log.error(
+                            "Не удалось выдать роль %s пользователю %s: %s",
+                            role,
+                            member,
+                            exc,
+                        )
 
-        ticket_data["status"] = "approved"
-        ticket_data["approved_by"] = interaction.user.id
-        ticket_data["approved_at"] = datetime.utcnow().isoformat()
-        save_tickets(tickets)
+        await update_ticket(
+            bot,
+            interaction.channel.id,
+            status="approved",
+            approved_by=interaction.user.id,
+            approved_at=msk_utcnow().isoformat(timespec="seconds"),
+        )
 
         if member:
             try:
                 await member.send(
                     f"✅ Ваша заявка в **{ticket_type}** была одобрена! Добро пожаловать!"
                 )
-            except discord.Forbidden:
-                pass
+            except discord.HTTPException as exc:
+                log.warning("Не удалось отправить ЛС %s: %s", member, exc)
 
-        embed = discord.Embed(
-            title="Заявка одобрена",
-            description=f"Заявка одобрена модератором {interaction.user.mention}.",
-            color=discord.Color.green(),
+        embed = style.success(
+            "Заявка одобрена",
+            f"Заявка одобрена модератором {interaction.user.mention}.",
+            footer=None,
         )
         await interaction.edit_original_response(embed=embed)
 
         await send_ticket_log(
-            interaction.client,
+            bot,
             "✅ Тикет одобрен",
-            f"**Тикет:** {interaction.channel.mention}\n**Пользователь:** <@{user_id}>\n**Одобрил:** {interaction.user}",
+            f"**Тикет:** {interaction.channel.mention}\n"
+            f"**Пользователь:** <@{user_id}>\n"
+            f"**Одобрил:** {interaction.user}",
         )
 
     @discord.ui.button(
@@ -424,42 +461,49 @@ class TicketClosedView(discord.ui.View):
     ):
         await interaction.response.defer()
 
-        tickets = load_tickets()
-        ticket_data = tickets.get(str(interaction.channel.id))
+        bot = interaction.client
+        ticket_data = await fetch_ticket(bot, interaction.channel.id)
 
         if not ticket_data:
-            await interaction.followup.send("Данные тикета не найдены.")
+            await interaction.followup.send(
+                embed=style.error("Ошибка", "Данные тикета не найдены.")
+            )
             return
 
         user_id = ticket_data.get("user_id")
         ticket_type = ticket_data.get("type")
         guild = interaction.guild
-        member = guild.get_member(user_id)
+        member = guild.get_member(int(user_id)) if user_id else None
 
-        ticket_data["status"] = "rejected"
-        ticket_data["rejected_by"] = interaction.user.id
-        ticket_data["rejected_at"] = datetime.utcnow().isoformat()
-        save_tickets(tickets)
+        await update_ticket(
+            bot,
+            interaction.channel.id,
+            status="rejected",
+            rejected_by=interaction.user.id,
+            rejected_at=msk_utcnow().isoformat(timespec="seconds"),
+        )
 
         if member:
             try:
                 await member.send(
                     f"❌ Ваша заявка в **{ticket_type}** была отклонена."
                 )
-            except discord.Forbidden:
-                pass
+            except discord.HTTPException as exc:
+                log.warning("Не удалось отправить ЛС %s: %s", member, exc)
 
-        embed = discord.Embed(
-            title="Заявка отклонена",
-            description=f"Заявка отклонена модератором {interaction.user.mention}.",
-            color=discord.Color.red(),
+        embed = style.error(
+            "Заявка отклонена",
+            f"Заявка отклонена модератором {interaction.user.mention}.",
+            footer=None,
         )
         await interaction.edit_original_response(embed=embed)
 
         await send_ticket_log(
-            interaction.client,
+            bot,
             "❌ Тикет отклонён",
-            f"**Тикет:** {interaction.channel.mention}\n**Пользователь:** <@{user_id}>\n**Отклонил:** {interaction.user}",
+            f"**Тикет:** {interaction.channel.mention}\n"
+            f"**Пользователь:** <@{user_id}>\n"
+            f"**Отклонил:** {interaction.user}",
         )
 
 
@@ -506,9 +550,10 @@ class TicketCog(commands.Cog):
     async def ticket_panel(
         self, interaction: discord.Interaction, channel: discord.TextChannel = None
     ):
-        if not interaction.user.guild_permissions.administrator:
+        if not style.is_admin(interaction):
             await interaction.response.send_message(
-                "У вас нет прав для использования этой команды.", ephemeral=True
+                embed=style.error("Нет прав", "У вас нет прав для использования этой команды."),
+                ephemeral=True,
             )
             return
 
@@ -516,9 +561,9 @@ class TicketCog(commands.Cog):
 
         target = channel or interaction.channel
 
-        embed = discord.Embed(
-            title="ПОДАЧА ЗАЯВКИ В КЛАН Group Military Slavic",
-            description=(
+        embed = style.base(
+            "ПОДАЧА ЗАЯВКИ В КЛАН Group Military Slavic",
+            (
                 "При подаче заявки, важно понимать, что есть условия вступления!\n\n"
                 "**Условия:**\n"
                 "🔹 Возраст от 16 лет (есть исключения)\n"
@@ -537,28 +582,28 @@ class TicketCog(commands.Cog):
                 "Если же у вас есть вопрос, можете воспользоваться общим чатом"
             ),
             color=discord.Color.dark_red(),
+            footer="Нажмите на кнопку ниже, чтобы подать заявку.",
         )
-        embed.set_footer(text="Нажмите на кнопку ниже, чтобы подать заявку.")
 
         await target.send(embed=embed, view=TicketCreateView())
 
         if channel:
-            await interaction.followup.send(
-                f"Панель тикетов отправлена в {channel.mention}.", ephemeral=True
-            )
+            text = f"Панель тикетов отправлена в {channel.mention}."
         else:
-            await interaction.followup.send(
-                "Панель тикетов отправлена.", ephemeral=True
-            )
+            text = "Панель тикетов отправлена."
+        await interaction.followup.send(
+            embed=style.success("🎫 Панель тикетов", text), ephemeral=True
+        )
 
     @ticket_group.command(name="promote_panel", description="Отправить панель заявок на повышение")
     @app_commands.describe(channel="Канал для панели")
     async def promote_panel(
         self, interaction: discord.Interaction, channel: discord.TextChannel = None
     ):
-        if not interaction.user.guild_permissions.administrator:
+        if not style.is_admin(interaction):
             await interaction.response.send_message(
-                "У вас нет прав для использования этой команды.", ephemeral=True
+                embed=style.error("Нет прав", "У вас нет прав для использования этой команды."),
+                ephemeral=True,
             )
             return
 
@@ -566,36 +611,35 @@ class TicketCog(commands.Cog):
 
         target = channel or interaction.channel
 
-        embed = discord.Embed(
-            title="📈 Заявка на повышение",
-            description=(
+        embed = style.base(
+            "📈 Заявка на повышение",
+            (
                 "Нажмите на кнопку ниже, чтобы подать заявку на повышение.\n\n"
                 "Убедитесь, что вы соответствуете требованиям должности, на которую претендуете."
             ),
             color=discord.Color.green(),
+            footer="Нажмите на кнопку ниже, чтобы создать заявку.",
         )
-        embed.set_footer(text="Нажмите на кнопку ниже, чтобы создать заявку.")
 
         await target.send(embed=embed, view=PromotionPanelView())
 
         if channel:
-            await interaction.followup.send(
-                f"Панель повышений отправлена в {channel.mention}.",
-                ephemeral=True,
-            )
+            text = f"Панель повышений отправлена в {channel.mention}."
         else:
-            await interaction.followup.send(
-                "Панель повышений отправлена.", ephemeral=True
-            )
+            text = "Панель повышений отправлена."
+        await interaction.followup.send(
+            embed=style.success("📈 Панель повышений", text), ephemeral=True
+        )
 
     @ticket_group.command(name="arma_panel", description="Отправить панель заявок на армача")
     @app_commands.describe(channel="Канал для панели")
     async def arma_panel(
         self, interaction: discord.Interaction, channel: discord.TextChannel = None
     ):
-        if not interaction.user.guild_permissions.administrator:
+        if not style.is_admin(interaction):
             await interaction.response.send_message(
-                "У вас нет прав для использования этой команды.", ephemeral=True
+                embed=style.error("Нет прав", "У вас нет прав для использования этой команды."),
+                ephemeral=True,
             )
             return
 
@@ -603,27 +647,25 @@ class TicketCog(commands.Cog):
 
         target = channel or interaction.channel
 
-        embed = discord.Embed(
-            title="⚔️ Заявка на армача",
-            description=(
+        embed = style.base(
+            "⚔️ Заявка на армача",
+            (
                 "Нажмите на кнопку ниже, чтобы подать заявку на армача.\n\n"
                 "Убедитесь, что вы хорошо освоили классы и имеете опыт."
             ),
             color=discord.Color.blue(),
+            footer="Нажмите на кнопку ниже, чтобы создать заявку.",
         )
-        embed.set_footer(text="Нажмите на кнопку ниже, чтобы создать заявку.")
 
         await target.send(embed=embed, view=ArmaPanelView())
 
         if channel:
-            await interaction.followup.send(
-                f"Панель армачей отправлена в {channel.mention}.",
-                ephemeral=True,
-            )
+            text = f"Панель армачей отправлена в {channel.mention}."
         else:
-            await interaction.followup.send(
-                "Панель армачей отправлена.", ephemeral=True
-            )
+            text = "Панель армачей отправлена."
+        await interaction.followup.send(
+            embed=style.success("⚔️ Панель армачей", text), ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):

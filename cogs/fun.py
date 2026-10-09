@@ -1,45 +1,116 @@
-import sys
-import os
-import asyncio
+"""Развлекательные команды: дуэли, КНБ, кубик, шар, голосования, напоминания."""
+
+from __future__ import annotations
+
+import logging
 import random
 import re
 from datetime import datetime, timedelta
 
 import discord
-from discord.ext import commands
 from discord import app_commands
+from discord.ext import commands
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from core.timeutil import msk_now
+from ui import style
+
+log = logging.getLogger(__name__)
+
+DUELS_KEY = "active_duels"
+DUEL_TTL = timedelta(minutes=3)
+
+POLL_REACTIONS = (
+    "1️⃣",
+    "2️⃣",
+    "3️⃣",
+    "4️⃣",
+    "5️⃣",
+    "6️⃣",
+    "7️⃣",
+    "8️⃣",
+    "9️⃣",
+    "🔟",
+)
+
+
+def _pair_key(user_a: int, user_b: int) -> str:
+    first, second = sorted((user_a, user_b))
+    return f"{first}_{second}"
+
+
+async def _active_duels(bot: commands.Bot) -> dict[str, str]:
+    data = await bot.state.get(DUELS_KEY, {})
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def _duel_is_fresh(expires_at: str, now: datetime) -> bool:
+    try:
+        deadline = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=now.tzinfo)
+    return deadline >= now
+
+
+async def _duel_reserve(bot: commands.Bot, pair_key: str) -> bool:
+    """True — вызов записан в bot.state, False — пара уже занята."""
+    now = msk_now()
+    duels = {
+        key: expires
+        for key, expires in (await _active_duels(bot)).items()
+        if _duel_is_fresh(expires, now)
+    }
+    if pair_key in duels:
+        return False
+    duels[pair_key] = (now + DUEL_TTL).isoformat(timespec="seconds")
+    await bot.state.set(DUELS_KEY, duels)
+    return True
+
+
+async def _duel_release(bot: commands.Bot, pair_key: str) -> None:
+    duels = await _active_duels(bot)
+    if pair_key in duels:
+        duels.pop(pair_key)
+        await bot.state.set(DUELS_KEY, duels)
 
 
 class FunCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.active_duels = {}
+
+    async def cog_load(self) -> None:
+        self.bot.scheduler.register_interval(
+            "reminders", self.deliver_reminders, seconds=15
+        )
+
+    # ------------------------------------------------------------ команды
 
     @app_commands.command(name="дуэль", description="Вызвать участника на дуэль")
     @app_commands.describe(opponent="Участник для дуэли")
     async def duel(self, interaction: discord.Interaction, opponent: discord.Member):
         if opponent.id == interaction.user.id:
             return await interaction.response.send_message(
-                "❌ Нельзя дуэлиться с самим собой.", ephemeral=True
+                embed=style.error("❌ Нельзя дуэлиться с самим собой."), ephemeral=True
             )
         if opponent.bot:
             return await interaction.response.send_message(
-                "❌ Боты не участвуют в дуэлях.", ephemeral=True
+                embed=style.error("❌ Боты не участвуют в дуэлях."), ephemeral=True
             )
-        pair_key = tuple(sorted([interaction.user.id, opponent.id]))
-        if pair_key in self.active_duels:
+
+        pair_key = _pair_key(interaction.user.id, opponent.id)
+        if not await _duel_reserve(self.bot, pair_key):
             return await interaction.response.send_message(
-                "❌ Дуэль уже запланирована между этими игроками.", ephemeral=True
+                embed=style.error("❌ Дуэль уже запланирована между этими игроками."),
+                ephemeral=True,
             )
 
-        self.active_duels[pair_key] = True
-
-        embed = discord.Embed(
-            title="⚔️ Дуэль!",
-            description=(
+        embed = style.base(
+            "⚔️ Дуэль!",
+            (
                 f"**{interaction.user.mention}** вызывает **{opponent.mention}** на дуэль!\n\n"
                 f"{opponent.mention}, нажми кнопку ниже чтобы принять вызов!"
             ),
@@ -50,8 +121,7 @@ class FunCog(commands.Cog):
         view = DuelAcceptView(
             challenger=interaction.user,
             opponent=opponent,
-            active_duels=self.active_duels,
-            pair_key=pair_key,
+            bot=self.bot,
         )
         await interaction.response.send_message(embed=embed, view=view)
 
@@ -81,9 +151,9 @@ class FunCog(commands.Cog):
             result = "Ты проиграл!"
             color = discord.Color.red()
 
-        embed = discord.Embed(
-            title="🪨✂️📄 Камень-Ножницы-Бумага",
-            description=(
+        embed = style.base(
+            "🪨✂️📄 Камень-Ножницы-Бумага",
+            (
                 f"**Ты:** {choices[user_val]}\n"
                 f"**Бот:** {choices[bot_choice]}\n\n"
                 f"**{result}**"
@@ -97,11 +167,12 @@ class FunCog(commands.Cog):
     async def dice(self, interaction: discord.Interaction, sides: int = 6):
         if sides < 2 or sides > 100:
             return await interaction.response.send_message(
-                "❌ Кубик должен иметь от 2 до 100 граней.", ephemeral=True
+                embed=style.error("❌ Кубик должен иметь от 2 до 100 граней."),
+                ephemeral=True,
             )
         result = random.randint(1, sides)
         await interaction.response.send_message(
-            f"🎲 **{result}** (из {sides})"
+            embed=style.base("🎲 Кубик", f"**{result}** (из {sides})")
         )
 
     @app_commands.command(name="8ball", description="Магический шар ответов")
@@ -131,10 +202,7 @@ class FunCog(commands.Cog):
             answer = random.choice(answers_negative)
             color = discord.Color.red()
 
-        embed = discord.Embed(
-            title="🎱 Магический шар",
-            color=color,
-        )
+        embed = style.base("🎱 Магический шар", color=color)
         embed.add_field(name="Вопрос", value=question, inline=False)
         embed.add_field(name="Ответ", value=f"*{answer}*", inline=False)
         await interaction.response.send_message(embed=embed)
@@ -158,32 +226,27 @@ class FunCog(commands.Cog):
         options = [opt for opt in [option1, option2, option3, option4] if opt]
         if len(options) < 2:
             return await interaction.response.send_message(
-                "❌ Нужно минимум 2 варианта.", ephemeral=True
+                embed=style.error("❌ Нужно минимум 2 варианта."), ephemeral=True
             )
         if len(options) > 10:
             return await interaction.response.send_message(
-                "❌ Максимум 10 вариантов.", ephemeral=True
+                embed=style.error("❌ Максимум 10 вариантов."), ephemeral=True
             )
 
-        reactions = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        lines = [f"{POLL_REACTIONS[i]} {opt}" for i, opt in enumerate(options)]
 
-        lines = []
-        for i, opt in enumerate(options):
-            lines.append(f"{reactions[i]} {opt}")
-
-        embed = discord.Embed(
-            title=f"📊 {question}",
-            description="\n".join(lines),
+        embed = style.base(
+            f"📊 {question}",
+            "\n".join(lines),
             color=discord.Color.blurple(),
-            timestamp=discord.utils.utcnow(),
+            footer=f"Голосование от {interaction.user.display_name}",
         )
-        embed.set_footer(text=f"Голосование от {interaction.user.display_name}")
-
+        embed.timestamp = discord.utils.utcnow()
         await interaction.response.send_message(embed=embed)
         msg = await interaction.original_response()
 
         for i in range(len(options)):
-            await msg.add_reaction(reactions[i])
+            await msg.add_reaction(POLL_REACTIONS[i])
 
     @app_commands.command(name="remind", description="Напомнить через указанное время")
     @app_commands.describe(
@@ -194,7 +257,7 @@ class FunCog(commands.Cog):
         match = re.match(r"(\d+)\s*(м|мин|ч|чч|д|дн)", time.lower())
         if not match:
             return await interaction.response.send_message(
-                "❌ Формат времени: `10м`, `2ч`, `1д`", ephemeral=True
+                embed=style.error("❌ Формат времени: `10м`, `2ч`, `1д`"), ephemeral=True
             )
 
         amount = int(match.group(1))
@@ -208,76 +271,115 @@ class FunCog(commands.Cog):
             delta = timedelta(days=amount)
         else:
             return await interaction.response.send_message(
-                "❌ Неизвестная единица времени.", ephemeral=True
+                embed=style.error("❌ Неизвестная единица времени."), ephemeral=True
             )
 
-        if delta.total_seconds() > 86400 * 7:
+        if delta > timedelta(days=config.REMINDER_MAX_DAYS):
             return await interaction.response.send_message(
-                "❌ Максимальное время — 7 дней.", ephemeral=True
+                embed=style.error(
+                    f"❌ Максимальное время — {config.REMINDER_MAX_DAYS} дней."
+                ),
+                ephemeral=True,
             )
 
-        embed = discord.Embed(
-            title="⏰ Напоминание установлено",
-            description=(
-                f"**Через:** {time}\n"
-                f"**Напоминание:** {message}"
-            ),
-            color=discord.Color.green(),
+        fire_at = msk_now() + delta
+        await self.bot.reminders.add(
+            interaction.user.id,
+            interaction.channel_id or 0,
+            fire_at,
+            message,
+        )
+
+        embed = style.success(
+            "⏰ Напоминание установлено",
+            f"**Через:** {time}\n**Напоминание:** {message}",
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        await asyncio.sleep(delta.total_seconds())
+    # ------------------------------------------------------------ доставка напоминаний
+
+    async def deliver_reminders(self) -> None:
+        """Фоновое задание: забирает созревшие напоминания из bot.reminders."""
+        now = msk_now()
+        try:
+            rows = await self.bot.reminders.due(now)
+        except Exception as exc:
+            log.error("Не удалось получить напоминания: %s", exc)
+            return
+
+        for row in rows:
+            reminder_id = int(row["id"])
+            try:
+                await self._send_reminder(row)
+            except Exception as exc:
+                log.warning("Не удалось доставить напоминание %s: %s", reminder_id, exc)
+            await self.bot.reminders.mark_delivered(reminder_id)
+
+    async def _send_reminder(self, row: dict) -> None:
+        user_id = int(row["user_id"])
+        channel_id = int(row.get("channel_id") or 0)
+        text = str(row.get("message") or "")
+        mention = f"<@{user_id}>"
+        dm_embed = style.base(
+            "⏰ Напоминание", text, color=discord.Color.gold(), footer=None
+        )
+        dm_embed.timestamp = discord.utils.utcnow()
 
         try:
-            user = await self.bot.fetch_user(interaction.user.id)
+            user = await self.bot.fetch_user(user_id)
             dm = await user.create_dm()
-            await dm.send(
-                content=interaction.user.mention,
-                embed=discord.Embed(
-                    title="⏰ Напоминание",
-                    description=message,
-                    color=discord.Color.gold(),
-                    timestamp=discord.utils.utcnow(),
+            await dm.send(content=mention, embed=dm_embed)
+            return
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException as exc:
+            log.warning("Не удалось отправить напоминание в ЛС %s: %s", user_id, exc)
+            return
+
+        channel = self.bot.channel_of(channel_id)
+        if channel is None:
+            log.warning(
+                "Напоминание для %s не доставлено: канал %s недоступен",
+                user_id,
+                channel_id,
+            )
+            return
+        try:
+            await channel.send(
+                content=mention,
+                embed=style.base(
+                    "⏰ Напоминание", text, color=discord.Color.gold(), footer=None
                 ),
             )
-        except discord.Forbidden:
-            try:
-                channel = interaction.channel
-                await channel.send(
-                    content=interaction.user.mention,
-                    embed=discord.Embed(
-                        title="⏰ Напоминание",
-                        description=message,
-                        color=discord.Color.gold(),
-                    ),
-                )
-            except Exception:
-                pass
+        except discord.HTTPException as exc:
+            log.warning(
+                "Не удалось отправить напоминание в канал %s: %s", channel_id, exc
+            )
 
 
 class DuelAcceptView(discord.ui.View):
-    def __init__(self, challenger: discord.Member, opponent: discord.Member, active_duels: dict, pair_key: tuple):
+    def __init__(self, challenger: discord.Member, opponent: discord.Member, bot: commands.Bot):
         super().__init__(timeout=30)
         self.challenger = challenger
         self.opponent = opponent
-        self.active_duels = active_duels
-        self.pair_key = pair_key
+        self.bot = bot
+        self.pair_key = _pair_key(challenger.id, opponent.id)
 
     @discord.ui.button(label="Принять вызов", style=discord.ButtonStyle.red, emoji="⚔️")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.opponent.id:
             return await interaction.response.send_message(
-                "❌ Этот вызов не для тебя.", ephemeral=True
+                embed=style.error("❌ Этот вызов не для тебя."), ephemeral=True
             )
 
-        self.active_duels.pop(self.pair_key, None)
+        await _duel_release(self.bot, self.pair_key)
         self.stop()
 
         a_hp = 100
         b_hp = 100
         a_name = self.challenger.mention
         b_name = self.opponent.mention
-        log = []
+        rounds_log = []
 
         turn = 0
         while a_hp > 0 and b_hp > 0:
@@ -297,7 +399,7 @@ class DuelAcceptView(discord.ui.View):
 
             crit_a = " 💥 КРИТ!" if a_crit else ""
             crit_b = " 💥 КРИТ!" if b_crit else ""
-            log.append(
+            rounds_log.append(
                 f"**Раунд {turn}:** {a_name} → **{a_dmg}**{crit_a} | "
                 f"{b_name} → **{b_dmg}**{crit_b}"
             )
@@ -312,22 +414,23 @@ class DuelAcceptView(discord.ui.View):
             winner_text = f"🏆 **{self.challenger.display_name}** победил!"
             color = discord.Color.green()
 
-        embed = discord.Embed(
-            title="⚔️ Результаты дуэли",
-            description="\n".join(log[-5:]) + f"\n\n{winner_text}",
+        embed = style.base(
+            "⚔️ Результаты дуэли",
+            "\n".join(rounds_log[-5:]) + f"\n\n{winner_text}",
             color=color,
-        )
-        embed.set_footer(
-            text=f"{self.challenger.display_name} {max(0, a_hp)} HP | {self.opponent.display_name} {max(0, b_hp)} HP"
+            footer=(
+                f"{self.challenger.display_name} {max(0, a_hp)} HP | "
+                f"{self.opponent.display_name} {max(0, b_hp)} HP"
+            ),
         )
 
         await interaction.response.edit_message(embed=embed, view=None)
 
     async def on_timeout(self):
-        self.active_duels.pop(self.pair_key, None)
+        await _duel_release(self.bot, self.pair_key)
         for item in self.children:
             item.disabled = True
 
 
-async def setup(bot: commands.Bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(FunCog(bot))

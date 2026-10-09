@@ -1,95 +1,265 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from helpers import send_log, load_events, save_events, build_event_embed
-import config
+"""Ивенты: создание через ЛС (7 шагов), RSVP, редактирование, отмена, напоминания.
 
-import datetime
+Состояние диалогов персистентно (bot.event_drafts — таблица event_drafts),
+поэтому рестарт не прерывает создание/редактирование ивента.
+Гроссбух load_events/save_events заменён точечными INSERT/UPDATE/DELETE через bot.db.
+"""
+
+from __future__ import annotations
+
+import json
 import logging
-import uuid
+from datetime import datetime
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
+
+from core.timeutil import msk_now
+from ui import style
+
+log = logging.getLogger(__name__)
 
 
-dm_event_states = {}
-user_active_flow = {}
-dm_edit_states = {}
-user_active_edit = {}
+# ------------------------------------------------------------ работа с БД
 
+_EVENT_COLUMNS = (
+    "id, name, start, briefing, description, creator_id, host_id, "
+    "going_inf, going_tech, going, maybe, sl, camera, not_going, show_not_going, "
+    "required, channel_id, image_url, event_type, location, date, time, "
+    "reminded_briefing_minus15, reminded_briefing, reminded_start_minus15"
+)
+
+_INSERT_EVENT = (
+    "INSERT INTO events (name, start, briefing, description, host_id, creator_id, "
+    "going_inf, going_tech, going, maybe, sl, camera, not_going, show_not_going, "
+    "required, channel_id, image_url, event_type, location, "
+    "reminded_briefing_minus15, reminded_briefing, reminded_start_minus15) "
+    "VALUES (?, ?, ?, ?, 0, ?, '[]', '[]', '[]', '[]', '[]', '[]', '[]', ?, 0, ?, ?, ?, '', 0, 0, 0) "
+    "RETURNING id"
+)
+
+_RSVP_KEYS = ("going_inf", "going_tech", "maybe", "sl", "camera", "not_going")
+
+_EDITABLE_FIELDS = {"name", "description", "briefing", "start", "image_url"}
+
+
+def _jlist(value) -> list:
+    try:
+        parsed = json.loads(value) if value else []
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _row_to_event(row: dict) -> dict:
+    going_inf = _jlist(row.get("going_inf"))
+    for u in _jlist(row.get("going")):
+        if u not in going_inf:
+            going_inf.append(u)
+    creator = row.get("creator_id") or row.get("host_id")
+    start = row.get("start") or (
+        f"{row.get('date', '')} {row.get('time', '')}".strip() if row.get("date") else ""
+    )
+    return {
+        "name": row.get("name") or "",
+        "start": start,
+        "briefing": row.get("briefing") or "",
+        "description": row.get("description") or "",
+        "creator_id": str(creator) if creator else "",
+        "going_inf": going_inf,
+        "going_tech": _jlist(row.get("going_tech")),
+        "maybe": _jlist(row.get("maybe")),
+        "sl": _jlist(row.get("sl")),
+        "camera": _jlist(row.get("camera")),
+        "not_going": _jlist(row.get("not_going")),
+        "show_not_going": bool(row.get("show_not_going")) if row.get("show_not_going") is not None else True,
+        "required": row.get("required") or 0,
+        "channel_id": row.get("channel_id") or 0,
+        "image_url": row.get("image_url") or "",
+        "event_type": row.get("event_type") or "freeform",
+        "location": row.get("location") or "",
+        "reminded_briefing_minus15": bool(row.get("reminded_briefing_minus15")),
+        "reminded_briefing": bool(row.get("reminded_briefing")),
+        "reminded_start_minus15": bool(row.get("reminded_start_minus15")),
+    }
+
+
+async def _fetch_event(db, event_id) -> dict | None:
+    try:
+        eid = int(event_id)
+    except (TypeError, ValueError):
+        return None
+    row = await db.fetchone(f"SELECT {_EVENT_COLUMNS} FROM events WHERE id = ?", (eid,))
+    return _row_to_event(row) if row else None
+
+
+async def _save_rsvp(db, event_id, event: dict) -> None:
+    sets = ", ".join(f"{key} = ?" for key in _RSVP_KEYS)
+    params = [json.dumps(event.get(key, [])) for key in _RSVP_KEYS]
+    params.append(int(event_id))
+    await db.execute(f"UPDATE events SET {sets} WHERE id = ?", params)
+
+
+async def _update_event_field(db, event_id, field: str, value: str) -> None:
+    if field not in _EDITABLE_FIELDS:
+        raise ValueError(f"Недопустимое поле: {field}")
+    await db.execute(f"UPDATE events SET {field} = ? WHERE id = ?", (value, int(event_id)))
+
+
+def _parse_dt(text: str | None) -> datetime | None:
+    """Парсинг «ДД.ММ.ГГГГ ЧЧ:ММ» (МСК). None вместо исключения."""
+    try:
+        return datetime.strptime((text or "").strip(), "%d.%m.%Y %H:%M")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _build_event_embed(event_id, data: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title=data["name"],
+        color=discord.Color.blurple()
+    )
+
+    if data.get("description"):
+        embed.add_field(name="Описание / Description", value=data["description"], inline=False)
+
+    start_display = (data.get("start") or f"{data.get('date', '')} {data.get('time', '')}") + " (МСК)"
+    briefing_display = (data.get("briefing") or start_display) + " (МСК)" if data.get("briefing") else start_display
+
+    embed.add_field(
+        name="Сбор / Briefing",
+        value=briefing_display,
+        inline=False
+    )
+
+    embed.add_field(
+        name="Начало / Start",
+        value=start_display,
+        inline=False
+    )
+
+    required = data.get("required", 0)
+    going_count = len(data.get("going_inf", [])) + len(data.get("going_tech", []))
+    if required > 0:
+        embed.add_field(
+            name="Нужно людей",
+            value=f"**{going_count}** / {required}",
+            inline=False
+        )
+
+    for key, label in [
+        ("going_inf", "🪖 Иду (пех)"),
+        ("going_tech", "🚜 Иду (тех)"),
+        ("maybe", "🤔 Возможно"),
+        ("sl", "🟠 SL"),
+        ("camera", "📷 Камера"),
+    ]:
+        users = data.get(key, [])
+        count = len(users)
+        if users:
+            value = "\n".join(f"<@{uid}>" for uid in users)
+        else:
+            value = "—"
+        embed.add_field(name=f"{label} ({count})", value=value, inline=True)
+
+    if data.get("show_not_going") or data.get("not_going"):
+        users = data.get("not_going", [])
+        count = len(users)
+        value = "\n".join(f"<@{uid}>" for uid in users) if users else "—"
+        embed.add_field(name=f"❌ Не иду ({count})", value=value, inline=True)
+
+    creator_id = data.get("creator_id")
+    if creator_id:
+        embed.add_field(
+            name="Создал / Created by",
+            value=f"<@{creator_id}>",
+            inline=False
+        )
+
+    if data.get("image_url"):
+        embed.set_image(url=data["image_url"])
+
+    embed.set_footer(text=f"ID: {event_id}")
+    return embed
+
+
+# ------------------------------------------------------------ view'ы диалога создания
 
 class EventTypeView(discord.ui.View):
-    def __init__(self, user_id: int, flow_id: str):
+    def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.flow_id = flow_id
 
-    def _state(self):
-        state = dm_event_states.get(self.flow_id)
-        if state and state.get("user_id") == self.user_id:
-            return state
+    async def _state(self, interaction: discord.Interaction) -> dict | None:
+        draft = await interaction.client.event_drafts.get(self.user_id)
+        if draft and draft[0] == "create" and isinstance(draft[1], dict):
+            return draft[1]
         return None
 
     @discord.ui.button(label="1 — Компетитив", style=discord.ButtonStyle.primary, custom_id="ev_type_comp")
     async def competitive(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = self._state()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        state = await self._state(interaction)
         if not state:
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
         state["event_type"] = "competitive"
         state["step"] = "description"
+        await interaction.client.event_drafts.set(self.user_id, "create", state)
         await interaction.response.edit_message(content="✅ Тип: **Компетитив**\n\n📝 Шаг 3/7 — Описание события\nВведите описание:", view=None)
 
     @discord.ui.button(label="2 — Свободная форма", style=discord.ButtonStyle.secondary, custom_id="ev_type_free")
     async def freeform(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = self._state()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        state = await self._state(interaction)
         if not state:
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
         state["event_type"] = "freeform"
         state["step"] = "description"
+        await interaction.client.event_drafts.set(self.user_id, "create", state)
         await interaction.response.edit_message(content="✅ Тип: **Свободная форма**\n\n📝 Шаг 3/7 — Описание события\nВведите описание:", view=None)
 
 
 class NotGoingickerView(discord.ui.View):
-    def __init__(self, user_id: int, flow_id: str):
+    def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.flow_id = flow_id
 
-    def _state(self):
-        state = dm_event_states.get(self.flow_id)
-        if state and state.get("user_id") == self.user_id:
-            return state
+    async def _state(self, interaction: discord.Interaction) -> dict | None:
+        draft = await interaction.client.event_drafts.get(self.user_id)
+        if draft and draft[0] == "create" and isinstance(draft[1], dict):
+            return draft[1]
         return None
 
     @discord.ui.button(label="1 — Да", style=discord.ButtonStyle.success, custom_id="ev_notgoing_yes")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = self._state()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        state = await self._state(interaction)
         if not state:
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
         state["show_not_going"] = True
+        await interaction.client.event_drafts.set(self.user_id, "create", state)
         await self._finish_preview(interaction, state)
 
     @discord.ui.button(label="2 — Нет", style=discord.ButtonStyle.danger, custom_id="ev_notgoing_no")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = self._state()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        state = await self._state(interaction)
         if not state:
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
         state["show_not_going"] = False
+        await interaction.client.event_drafts.set(self.user_id, "create", state)
         await self._finish_preview(interaction, state)
 
-    async def _finish_preview(self, interaction: discord.Interaction, state):
+    async def _finish_preview(self, interaction: discord.Interaction, state: dict):
         embed = self._build_preview(state)
-        await interaction.response.edit_message(content="📋 **Превью события:**", embed=embed, view=PublishConfirmView(self.user_id, self.flow_id))
+        await interaction.response.edit_message(content="📋 **Превью события:**", embed=embed, view=PublishConfirmView(self.user_id))
 
-    def _build_preview(self, state):
+    def _build_preview(self, state: dict) -> discord.Embed:
         embed = discord.Embed(title=state["name"], color=discord.Color.blurple())
         if state.get("description"):
             embed.add_field(name="Описание / Description", value=state["description"], inline=False)
@@ -109,76 +279,76 @@ class NotGoingickerView(discord.ui.View):
 
 
 class PublishConfirmView(discord.ui.View):
-    def __init__(self, user_id: int, flow_id: str):
+    def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.flow_id = flow_id
-
-    def _clear_active(self):
-        if user_active_flow.get(self.user_id) == self.flow_id:
-            user_active_flow.pop(self.user_id, None)
 
     @discord.ui.button(label="1 — Да, опубликовать", style=discord.ButtonStyle.success, custom_id="ev_publish_yes")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = dm_event_states.pop(self.flow_id, None)
-        if not state or state.get("user_id") != self.user_id:
-            self._clear_active()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        db = interaction.client.db
+        draft = await interaction.client.event_drafts.get(self.user_id)
+        if not draft or draft[0] != "create" or not isinstance(draft[1], dict):
+            await interaction.client.event_drafts.clear(self.user_id)
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
+        state = draft[1]
+        await interaction.client.event_drafts.clear(self.user_id)
 
-        channel = interaction.client.get_channel(state["channel_id"])
-        if not channel:
+        channel = interaction.client.channel_of(int(state.get("channel_id") or 0))
+        if channel is None:
             return await interaction.response.edit_message(content="❌ Канал не найден.", embed=None, view=None)
 
-        event_id = str(interaction.id)
-        events = load_events()
-        events[event_id] = {
-            "name": state["name"],
-            "description": state.get("description", ""),
-            "start": state["start"],
-            "briefing": state["briefing"],
-            "location": "",
-            "going_inf": [],
-            "going_tech": [],
-            "maybe": [],
-            "sl": [],
-            "camera": [],
-            "not_going": [],
-            "show_not_going": state.get("show_not_going", False),
-            "required": 0,
-            "channel_id": state["channel_id"],
-            "creator_id": self.user_id,
-            "image_url": state.get("image_url", ""),
-            "event_type": state.get("event_type", "freeform"),
-        }
-        save_events(events)
+        try:
+            row = await db.fetchone(
+                _INSERT_EVENT,
+                (
+                    state.get("name", ""),
+                    state.get("start", ""),
+                    state.get("briefing", ""),
+                    state.get("description", ""),
+                    self.user_id,
+                    int(bool(state.get("show_not_going", False))),
+                    int(state.get("channel_id") or 0),
+                    state.get("image_url", ""),
+                    state.get("event_type", "freeform"),
+                ),
+            )
+        except Exception:
+            log.exception("Ошибка вставки ивента")
+            return await interaction.response.edit_message(content="❌ Не удалось опубликовать ивент.", embed=None, view=None)
+        if not row:
+            return await interaction.response.edit_message(content="❌ Не удалось опубликовать ивент.", embed=None, view=None)
 
-        embed = build_event_embed(event_id, events[event_id])
+        event_id = str(row["id"])
+        event = await _fetch_event(db, event_id)
+        if event is None:
+            return await interaction.response.edit_message(content="❌ Не удалось опубликовать ивент.", embed=None, view=None)
+
+        embed = _build_event_embed(event_id, event)
         view = EventRSVPSelectView(event_id, creator_id=self.user_id)
         await channel.send(embed=embed, view=view)
-        self._clear_active()
         await interaction.response.edit_message(content="✅ **Ивент опубликован!**", embed=None, view=None)
 
     @discord.ui.button(label="2 — Нет, отменить", style=discord.ButtonStyle.danger, custom_id="ev_publish_no")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        dm_event_states.pop(self.flow_id, None)
-        self._clear_active()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        await interaction.client.event_drafts.clear(self.user_id)
         await interaction.response.edit_message(content="❌ Создание ивента отменено.", embed=None, view=None)
 
 
+# ------------------------------------------------------------ view'ы редактирования
+
 class EventEditSelectView(discord.ui.View):
-    def __init__(self, user_id: int, flow_id: str):
+    def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.flow_id = flow_id
 
-    def _state(self):
-        state = dm_edit_states.get(self.flow_id)
-        if state and state.get("user_id") == self.user_id:
-            return state
+    async def _state(self, interaction: discord.Interaction) -> dict | None:
+        draft = await interaction.client.event_drafts.get(self.user_id)
+        if draft and draft[0] == "edit" and isinstance(draft[1], dict):
+            return draft[1]
         return None
 
     @discord.ui.select(
@@ -194,17 +364,17 @@ class EventEditSelectView(discord.ui.View):
     )
     async def select_field(self, interaction: discord.Interaction, select: discord.ui.Select):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = self._state()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        state = await self._state(interaction)
         if not state:
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
 
         field = select.values[0]
         state["field"] = field
         state["step"] = "awaiting_value"
+        await interaction.client.event_drafts.set(self.user_id, "edit", state)
 
-        events = load_events()
-        event = events.get(state["event_id"])
+        event = await _fetch_event(interaction.client.db, state.get("event_id"))
         if not event:
             return await interaction.response.edit_message(content="❌ Ивент не найден.", embed=None, view=None)
 
@@ -234,76 +404,87 @@ class EventEditSelectView(discord.ui.View):
 
 
 class EventEditConfirmView(discord.ui.View):
-    def __init__(self, user_id: int, flow_id: str):
+    def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.flow_id = flow_id
 
-    def _state(self):
-        state = dm_edit_states.get(self.flow_id)
-        if state and state.get("user_id") == self.user_id:
-            return state
+    async def _state(self, interaction: discord.Interaction) -> dict | None:
+        draft = await interaction.client.event_drafts.get(self.user_id)
+        if draft and draft[0] == "edit" and isinstance(draft[1], dict):
+            return draft[1]
         return None
 
     @discord.ui.button(label="✅ Сохранить", style=discord.ButtonStyle.success, custom_id="ev_edit_save")
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        state = self._state()
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        state = await self._state(interaction)
         if not state:
             return await interaction.response.edit_message(content="❌ Состояние утеряно.", embed=None, view=None)
 
-        events = load_events()
-        event = events.get(state["event_id"])
+        db = interaction.client.db
+        event = await _fetch_event(db, state.get("event_id"))
         if not event:
+            await interaction.client.event_drafts.clear(self.user_id)
             return await interaction.response.edit_message(content="❌ Ивент не найден.", embed=None, view=None)
 
-        event[state["field"]] = state["new_value"]
-        save_events(events)
+        field = state.get("field")
+        new_value = state.get("new_value", "")
+        try:
+            await _update_event_field(db, state["event_id"], field, new_value)
+        except ValueError:
+            log.error("Edit: недопустимое поле %r", field)
+            return await interaction.response.edit_message(content="❌ Ивент не найден.", embed=None, view=None)
 
-        embed = build_event_embed(state["event_id"], event)
-        channel = interaction.client.get_channel(state["channel_id"])
+        event[field] = new_value
+        embed = _build_event_embed(state["event_id"], event)
+        channel = interaction.client.channel_of(int(state.get("channel_id") or 0))
         if channel:
             try:
                 msg = await channel.fetch_message(state["message_id"])
                 await msg.edit(embed=embed)
             except (discord.NotFound, discord.HTTPException) as e:
-                logging.info("Edit: не удалось обновить эмбед (%s): %s", type(e).__name__, e)
+                log.info("Edit: не удалось обновить эмбед (%s): %s", type(e).__name__, e)
 
-        dm_edit_states.pop(self.flow_id, None)
-        user_active_edit.pop(self.user_id, None)
+        await interaction.client.event_drafts.clear(self.user_id)
         await interaction.response.edit_message(content="✅ Ивент обновлён!", embed=None, view=None)
 
     @discord.ui.button(label="❌ Отмена", style=discord.ButtonStyle.danger, custom_id="ev_edit_cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Не для тебя.", ephemeral=True)
-        dm_edit_states.pop(self.flow_id, None)
-        user_active_edit.pop(self.user_id, None)
+            return await interaction.response.send_message(embed=style.error("Не для тебя."), ephemeral=True)
+        await interaction.client.event_drafts.clear(self.user_id)
         await interaction.response.edit_message(content="❌ Редактирование отменено.", embed=None, view=None)
 
 
+# ------------------------------------------------------------ persistent view ивента
+
 class EventRSVPSelectView(discord.ui.View):
-    def __init__(self, event_id: str, creator_id: int = 0):
+    """RSVP-панель ивента. Регистрируется в bot.py как persistent (event_id="0")."""
+
+    def __init__(self, event_id: str = "0", creator_id: int = 0):
         super().__init__(timeout=None)
         self.event_id = event_id
         self.creator_id = creator_id
 
-    def _get_event_id(self, interaction: discord.Interaction) -> str | None:
+    async def _get_event_id(self, interaction: discord.Interaction) -> str | None:
+        if self.event_id and self.event_id != "0":
+            return self.event_id
         msg = interaction.message
         if msg and msg.embeds:
             footer = msg.embeds[0].footer.text or ""
-            logging.info("_get_event_id: footer=%r, embed title=%r", footer, msg.embeds[0].title)
+            log.info("_get_event_id: footer=%r, embed title=%r", footer, msg.embeds[0].title)
             if footer.startswith("ID: "):
                 return footer[4:]
             title = msg.embeds[0].title or ""
             if title:
-                events = load_events()
-                for eid, data in events.items():
-                    if data.get("name") == title:
-                        return eid
+                row = await interaction.client.db.fetchone(
+                    "SELECT id FROM events WHERE name = ? LIMIT 1", (title,)
+                )
+                if row:
+                    return str(row["id"])
         else:
-            logging.warning("_get_event_id: no embeds on message. msg=%s", msg)
+            log.warning("_get_event_id: no embeds on message. msg=%s", msg)
         return None
 
     @discord.ui.select(
@@ -319,27 +500,26 @@ class EventRSVPSelectView(discord.ui.View):
         custom_id="event_rsvp_select",
     )
     async def rsvp_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        logging.info("RSVP select: value=%s, user=%s (%s)", select.values[0], interaction.user, interaction.user.id)
-        eid = self._get_event_id(interaction)
+        log.info("RSVP select: value=%s, user=%s (%s)", select.values[0], interaction.user, interaction.user.id)
+        eid = await self._get_event_id(interaction)
         if not eid:
-            return await interaction.response.send_message("Ивент не найден.", ephemeral=True)
+            return await interaction.response.send_message(embed=style.error("Ивент не найден."), ephemeral=True)
         await self.rsvp(interaction, select.values[0], eid)
 
     @discord.ui.button(label="✏️ Редактировать", style=discord.ButtonStyle.secondary, custom_id="event_edit")
     async def edit_event(self, interaction: discord.Interaction, button: discord.ui.Button):
-        eid = self._get_event_id(interaction)
+        eid = await self._get_event_id(interaction)
         if not eid:
-            return await interaction.response.send_message("Ивент не найден.", ephemeral=True)
+            return await interaction.response.send_message(embed=style.error("Ивент не найден."), ephemeral=True)
 
-        events = load_events()
-        event = events.get(eid)
+        event = await _fetch_event(interaction.client.db, eid)
         if not event:
-            return await interaction.response.send_message("Ивент не найден.", ephemeral=True)
+            return await interaction.response.send_message(embed=style.error("Ивент не найден."), ephemeral=True)
 
         creator_id = str(event.get("creator_id") or "")
         if str(interaction.user.id) != creator_id:
             return await interaction.response.send_message(
-                "Только создатель ивента может его редактировать.", ephemeral=True
+                embed=style.error("Только создатель ивента может его редактировать."), ephemeral=True
             )
 
         try:
@@ -349,45 +529,41 @@ class EventRSVPSelectView(discord.ui.View):
             )
         except discord.Forbidden:
             return await interaction.response.send_message(
-                "❌ Не могу отправить ЛС. Открой личные сообщения.", ephemeral=True
+                embed=style.error("❌ Не могу отправить ЛС. Открой личные сообщения."), ephemeral=True
             )
 
-        flow_id = uuid.uuid4().hex
-        dm_edit_states[flow_id] = {
-            "user_id": interaction.user.id,
+        await interaction.client.event_drafts.set(interaction.user.id, "edit", {
             "event_id": eid,
             "channel_id": interaction.message.channel.id,
             "message_id": interaction.message.id,
             "step": "choose_field",
-        }
-        user_active_edit[interaction.user.id] = flow_id
+        })
         await interaction.user.send(
             "Выбери поле для редактирования:",
-            view=EventEditSelectView(interaction.user.id, flow_id),
+            view=EventEditSelectView(interaction.user.id),
         )
-        await interaction.response.send_message("✅ Проверь ЛС!", ephemeral=True)
+        await interaction.response.send_message(embed=style.success("✅ Проверь ЛС!"), ephemeral=True)
 
     @discord.ui.button(label="🚫 Отменить ивент", style=discord.ButtonStyle.danger, custom_id="event_cancel")
     async def cancel_event(self, interaction: discord.Interaction, button: discord.ui.Button):
-        eid = self._get_event_id(interaction)
+        eid = await self._get_event_id(interaction)
         if not eid:
-            return await interaction.response.send_message("Ивент не найден.", ephemeral=True)
+            return await interaction.response.send_message(embed=style.error("Ивент не найден."), ephemeral=True)
 
-        events = load_events()
-        event = events.get(eid)
+        event = await _fetch_event(interaction.client.db, eid)
         if not event:
             return await interaction.response.send_message(
-                "Ивент не найден.", ephemeral=True
+                embed=style.error("Ивент не найден."), ephemeral=True
             )
 
         creator_id = str(event.get("creator_id") or "")
         if str(interaction.user.id) != creator_id:
             return await interaction.response.send_message(
-                "Только создатель ивента может его отменить.", ephemeral=True
+                embed=style.error("Только создатель ивента может его отменить."), ephemeral=True
             )
 
         await interaction.response.send_message(
-            "Вы уверены, что хотите отменить ивент?",
+            embed=style.warning("Вы уверены, что хотите отменить ивент?"),
             view=EventCancelConfirmView(
                 eid,
                 channel_id=interaction.message.channel.id,
@@ -398,47 +574,44 @@ class EventRSVPSelectView(discord.ui.View):
 
     async def rsvp(self, interaction: discord.Interaction, key: str, eid: str):
         uid = str(interaction.user.id)
-        events = load_events()
-        event = events.get(eid)
-        logging.info(
+        db = interaction.client.db
+        event = await _fetch_event(db, eid)
+        log.info(
             "RSVP rsvp: event_id=%r, key=%s, user=%s, event_found=%s",
             eid, key, uid, event is not None
         )
         if not event:
-            logging.warning(
-                "RSVP rsvp: event not found! event_id=%r, available=%s",
-                eid, list(events.keys())
-            )
+            log.warning("RSVP rsvp: event not found! event_id=%r", eid)
             return await interaction.response.send_message(
-                "Ивент не найден.", ephemeral=True
+                embed=style.error("Ивент не найден."), ephemeral=True
             )
 
         already_in = uid in event.get(key, [])
 
-        for k in ("going_inf", "going_tech", "maybe", "sl", "camera", "not_going"):
+        for k in _RSVP_KEYS:
             if uid in event.get(k, []):
                 event[k].remove(uid)
 
         if not already_in:
             event.setdefault(key, []).append(uid)
 
-        save_events(events)
+        await _save_rsvp(db, eid, event)
 
-        embed = build_event_embed(eid, event)
+        embed = _build_event_embed(eid, event)
         try:
             await interaction.response.edit_message(embed=embed)
         except (discord.NotFound, discord.HTTPException) as e:
-            logging.info("RSVP edit_message пропущен (%s): %s", type(e).__name__, e)
+            log.info("RSVP edit_message пропущен (%s): %s", type(e).__name__, e)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        logging.error("Ошибка в EventRSVPSelectView: %s", error, exc_info=True)
+        log.error("Ошибка в EventRSVPSelectView: %s", error, exc_info=True)
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message("❌ Произошла ошибка.", ephemeral=True)
             else:
                 await interaction.followup.send("❌ Произошла ошибка.", ephemeral=True)
         except Exception:
-            pass
+            log.warning("Не удалось ответить на ошибку EventRSVPSelectView", exc_info=True)
 
 
 class EventCancelConfirmView(discord.ui.View):
@@ -450,16 +623,16 @@ class EventCancelConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Да, отменить", style=discord.ButtonStyle.danger, custom_id="event_cancel_confirm2")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        events = load_events()
-        event = events.pop(self.event_id, None)
+        db = interaction.client.db
+        event = await _fetch_event(db, self.event_id)
         if not event:
             await interaction.response.edit_message(content="Ивент уже удалён.", view=None)
             return
 
-        save_events(events)
+        await db.execute("DELETE FROM events WHERE id = ?", (int(self.event_id),))
 
         if self.channel_id and self.message_id:
-            channel = interaction.client.get_channel(self.channel_id)
+            channel = interaction.client.channel_of(self.channel_id)
             if channel:
                 try:
                     msg = await channel.fetch_message(self.message_id)
@@ -467,14 +640,17 @@ class EventCancelConfirmView(discord.ui.View):
                         embed = msg.embeds[0]
                         embed.title = f"{embed.title} — Отменён"
                         embed.color = discord.Color.red()
-                        view = EventRSVPSelectView(self.event_id, creator_id=event.get("creator_id") or 0)
+                        creator = event.get("creator_id") or 0
+                        view = EventRSVPSelectView(
+                            self.event_id, creator_id=int(creator) if str(creator).isdigit() else 0
+                        )
                         for child in view.children:
                             child.disabled = True
                         await msg.edit(embed=embed, view=view)
                 except discord.NotFound:
-                    logging.info("Отмена: сообщение ивента не найдено (удалено?)")
+                    log.info("Отмена: сообщение ивента не найдено (удалено?)")
                 except (discord.HTTPException, discord.Forbidden) as e:
-                    logging.info("Отмена: не удалось обновить эмбед (%s): %s", type(e).__name__, e)
+                    log.info("Отмена: не удалось обновить эмбед (%s): %s", type(e).__name__, e)
 
         await interaction.response.edit_message(content="Ивент отменён.", view=None)
 
@@ -483,15 +659,17 @@ class EventCancelConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Ивент не отменён.", view=None)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        logging.error("Ошибка в EventCancelConfirmView: %s", error, exc_info=True)
+        log.error("Ошибка в EventCancelConfirmView: %s", error, exc_info=True)
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message("❌ Произошла ошибка.", ephemeral=True)
             else:
                 await interaction.followup.send("❌ Произошла ошибка.", ephemeral=True)
         except Exception:
-            pass
+            log.warning("Не удалось ответить на ошибку EventCancelConfirmView", exc_info=True)
 
+
+# ------------------------------------------------------------ напоминания
 
 def _plural(n, one, few, many):
     n10 = n % 10
@@ -534,6 +712,8 @@ def _relative_str(dt, now):
     return f"{days} {unit} назад"
 
 
+# ------------------------------------------------------------ ког
+
 class EventCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -541,8 +721,8 @@ class EventCog(commands.Cog):
     def _reminder_text(self, name, label, dt, now):
         return f"🔔 {name} — {label} {_relative_str(dt, now)}!"
 
-    async def cog_load(self):
-        self.event_reminder.start()
+    async def cog_load(self) -> None:
+        self.bot.scheduler.register_interval("event_reminder", self.event_reminder, seconds=60)
 
     @app_commands.command(name="event", description="Создать ивент через ЛС")
     async def event_cmd(self, interaction: discord.Interaction):
@@ -553,17 +733,14 @@ class EventCog(commands.Cog):
             )
         except discord.Forbidden:
             return await interaction.response.send_message(
-                "❌ Не могу отправить ЛС. Открой личные сообщения.", ephemeral=True
+                embed=style.error("❌ Не могу отправить ЛС. Открой личные сообщения."), ephemeral=True
             )
 
-        flow_id = uuid.uuid4().hex
-        dm_event_states[flow_id] = {
-            "user_id": interaction.user.id,
-            "channel_id": interaction.channel.id,
+        await self.bot.event_drafts.set(interaction.user.id, "create", {
+            "channel_id": interaction.channel_id,
             "step": "name",
-        }
-        user_active_flow[interaction.user.id] = flow_id
-        await interaction.response.send_message("✅ Проверь ЛС!", ephemeral=True)
+        })
+        await interaction.response.send_message(embed=style.success("✅ Проверь ЛС!"), ephemeral=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -573,35 +750,40 @@ class EventCog(commands.Cog):
             return
 
         uid = message.author.id
+        draft = await self.bot.event_drafts.get(uid)
+        if not draft or not isinstance(draft[1], dict):
+            return
+        flow, payload = draft
+
+        if flow == "edit":
+            if payload.get("step") == "awaiting_value":
+                await self._handle_edit_message(message, payload)
+            return
+
+        if flow == "create":
+            await self._handle_create_message(message, payload)
+
+    async def _handle_create_message(self, message: discord.Message, state: dict):
+        uid = message.author.id
         text = message.content.strip()
-
-        edit_flow_id = user_active_edit.get(uid)
-        edit_state = dm_edit_states.get(edit_flow_id) if edit_flow_id else None
-        if edit_state and edit_state.get("user_id") == uid and edit_state.get("step") == "awaiting_value":
-            await self._handle_edit_message(message, edit_state, edit_flow_id)
-            return
-
-        flow_id = user_active_flow.get(uid)
-        state = dm_event_states.get(flow_id) if flow_id else None
-        if not state or state.get("user_id") != uid:
-            return
-
-        step = state["step"]
+        step = state.get("step")
 
         if step == "name":
             if not text:
                 return await message.channel.send("❌ Название не может быть пустым. Попробуй ещё раз:")
             state["name"] = text
             state["step"] = "type"
+            await self.bot.event_drafts.set(uid, "create", state)
             await message.channel.send(
                 f"✅ Название: **{text}**\n\n"
                 "📝 **Шаг 2/7 — Тип события**",
-                view=EventTypeView(uid, flow_id),
+                view=EventTypeView(uid),
             )
 
         elif step == "description":
             state["description"] = text if text != "-" else ""
             state["step"] = "briefing"
+            await self.bot.event_drafts.set(uid, "create", state)
             await message.channel.send(
                 "✅ Описание сохранено.\n\n"
                 "📢 **Шаг 4/7 — Время сбора / Briefing**\n"
@@ -611,15 +793,14 @@ class EventCog(commands.Cog):
             )
 
         elif step == "briefing":
-            try:
-                datetime.datetime.strptime(text, "%d.%m.%Y %H:%M")
-            except ValueError:
+            if _parse_dt(text) is None:
                 return await message.channel.send(
                     "❌ Неверный формат. Используй ДД.ММ.ГГГГ ЧЧ:ММ\n"
                     "Пример: 25.04.2026 19:00"
                 )
             state["briefing"] = text
             state["step"] = "start"
+            await self.bot.event_drafts.set(uid, "create", state)
             await message.channel.send(
                 f"✅ Сбор: **{text} (МСК)**\n\n"
                 "⏰ **Шаг 5/7 — Время начала / Start**\n"
@@ -629,15 +810,14 @@ class EventCog(commands.Cog):
             )
 
         elif step == "start":
-            try:
-                datetime.datetime.strptime(text, "%d.%m.%Y %H:%M")
-            except ValueError:
+            if _parse_dt(text) is None:
                 return await message.channel.send(
                     "❌ Неверный формат. Используй ДД.ММ.ГГГГ ЧЧ:ММ\n"
                     "Пример: 25.04.2026 20:00"
                 )
             state["start"] = text
             state["step"] = "image"
+            await self.bot.event_drafts.set(uid, "create", state)
             await message.channel.send(
                 f"✅ Начало: **{text} (МСК)**\n\n"
                 "🖼 **Шаг 6/7 — Изображение**\n"
@@ -654,19 +834,19 @@ class EventCog(commands.Cog):
                     "❌ Прикрепи изображение или отправь `-` чтобы пропустить."
                 )
             state["step"] = "not_going"
+            await self.bot.event_drafts.set(uid, "create", state)
             await message.channel.send(
                 "✅ Изображение обработано.\n\n"
                 "❌ **Шаг 7/7 — Кнопка 'Не иду'**\n"
                 "Включить кнопку отказа?",
-                view=NotGoingickerView(uid, flow_id),
+                view=NotGoingickerView(uid),
             )
 
-    async def _handle_edit_message(self, message, state, flow_id):
+    async def _handle_edit_message(self, message: discord.Message, state: dict):
+        uid = message.author.id
         field = state.get("field")
         if field == "briefing" or field == "start":
-            try:
-                datetime.datetime.strptime(message.content.strip(), "%d.%m.%Y %H:%M")
-            except ValueError:
+            if _parse_dt(message.content.strip()) is None:
                 return await message.channel.send(
                     "❌ Неверный формат. Используй ДД.ММ.ГГГГ ЧЧ:ММ\n"
                     "Пример: 25.04.2026 19:00"
@@ -687,15 +867,14 @@ class EventCog(commands.Cog):
                 return await message.channel.send("❌ Название не может быть пустым.")
             state["new_value"] = value
 
-        events = load_events()
-        event = events.get(state["event_id"])
+        event = await _fetch_event(self.bot.db, state.get("event_id"))
         if not event:
             await message.channel.send("❌ Ивент не найден.")
-            user_active_edit.pop(message.author.id, None)
-            dm_edit_states.pop(flow_id, None)
+            await self.bot.event_drafts.clear(uid)
             return
 
-        event[field] = state["new_value"]
+        await self.bot.event_drafts.set(uid, "edit", state)
+
         preview = discord.Embed(
             title="📋 Превью изменений",
             description=f"**{event['name']}**",
@@ -712,101 +891,95 @@ class EventCog(commands.Cog):
         preview.add_field(name=field_labels.get(field, field), value=display, inline=False)
         await message.channel.send(
             embed=preview,
-            view=EventEditConfirmView(message.author.id, flow_id),
+            view=EventEditConfirmView(uid),
         )
 
-    @tasks.loop(minutes=1)
-    async def event_reminder(self):
+    async def event_reminder(self) -> None:
         try:
-            events = load_events()
-            now = datetime.datetime.now()
-            changed = False
+            rows = await self.bot.db.fetchall(f"SELECT {_EVENT_COLUMNS} FROM events")
+            now = msk_now().replace(tzinfo=None)
 
-            for event_id, data in events.items():
-                try:
-                    start_str = data.get("start") or f"{data.get('date', '')} {data.get('time', '')}"
-                    start_dt = datetime.datetime.strptime(
-                        start_str, "%d.%m.%Y %H:%M"
-                    )
-                except ValueError:
+            for row in rows:
+                data = _row_to_event(row)
+                event_id = row["id"]
+
+                start_dt = _parse_dt(data.get("start"))
+                if start_dt is None:
                     continue
-
-                briefing_str = data.get("briefing") or start_str
-                try:
-                    briefing_dt = datetime.datetime.strptime(
-                        briefing_str, "%d.%m.%Y %H:%M"
-                    )
-                except ValueError:
-                    briefing_dt = start_dt
+                briefing_dt = _parse_dt(data.get("briefing")) or start_dt
 
                 users = (
                     data.get("going_inf", [])
                     + data.get("going_tech", [])
-                    + data.get("going", [])
                     + data.get("sl", [])
                     + data.get("camera", [])
                 )
                 mentions = " ".join(f"<@{uid}>" for uid in users)
                 channel_id = data.get("channel_id")
-                channel = self.bot.get_channel(channel_id) if channel_id else None
+                channel = self.bot.channel_of(channel_id) if channel_id else None
 
                 briefing_diff = (briefing_dt - now).total_seconds() / 60
                 start_diff = (start_dt - now).total_seconds() / 60
 
-                if -1 <= briefing_diff <= 14 and not data.get("reminded_briefing_minus15"):
+                if -1 <= briefing_diff <= 14 and not data["reminded_briefing_minus15"]:
                     if not users:
-                        data["reminded_briefing_minus15"] = True
-                        changed = True
+                        await self.bot.db.execute(
+                            "UPDATE events SET reminded_briefing_minus15 = 1 WHERE id = ?",
+                            (event_id,),
+                        )
                     elif channel:
                         try:
                             text = self._reminder_text(
                                 data["name"], "📢 Сбор / Briefing", briefing_dt, now
                             )
                             await channel.send(content=f"{mentions} {text}")
-                            data["reminded_briefing_minus15"] = True
-                            changed = True
+                            await self.bot.db.execute(
+                                "UPDATE events SET reminded_briefing_minus15 = 1 WHERE id = ?",
+                                (event_id,),
+                            )
                         except Exception as e:
-                            logging.error("Ошибка напоминания (briefing -15): %s", e)
+                            log.error("Ошибка напоминания (briefing -15): %s", e)
 
-                if -1 <= briefing_diff <= 0 and not data.get("reminded_briefing"):
+                if -1 <= briefing_diff <= 0 and not data["reminded_briefing"]:
                     if not users:
-                        data["reminded_briefing"] = True
-                        changed = True
+                        await self.bot.db.execute(
+                            "UPDATE events SET reminded_briefing = 1 WHERE id = ?",
+                            (event_id,),
+                        )
                     elif channel:
                         try:
                             text = self._reminder_text(
                                 data["name"], "📢 Сбор / Briefing", briefing_dt, now
                             )
                             await channel.send(content=f"{mentions} {text}")
-                            data["reminded_briefing"] = True
-                            changed = True
+                            await self.bot.db.execute(
+                                "UPDATE events SET reminded_briefing = 1 WHERE id = ?",
+                                (event_id,),
+                            )
                         except Exception as e:
-                            logging.error("Ошибка напоминания (briefing): %s", e)
+                            log.error("Ошибка напоминания (briefing): %s", e)
 
-                if -1 <= start_diff <= 14 and not data.get("reminded_start_minus15"):
+                if -1 <= start_diff <= 14 and not data["reminded_start_minus15"]:
                     if not users:
-                        data["reminded_start_minus15"] = True
-                        changed = True
+                        await self.bot.db.execute(
+                            "UPDATE events SET reminded_start_minus15 = 1 WHERE id = ?",
+                            (event_id,),
+                        )
                     elif channel:
                         try:
                             text = self._reminder_text(
                                 data["name"], "⏰ Начало / Start", start_dt, now
                             )
                             await channel.send(content=f"{mentions} {text}")
-                            data["reminded_start_minus15"] = True
-                            changed = True
+                            await self.bot.db.execute(
+                                "UPDATE events SET reminded_start_minus15 = 1 WHERE id = ?",
+                                (event_id,),
+                            )
                         except Exception as e:
-                            logging.error("Ошибка напоминания (start -15): %s", e)
+                            log.error("Ошибка напоминания (start -15): %s", e)
 
-            if changed:
-                save_events(events)
-
-        except Exception as e:
-            logging.error("Ошибка event_reminder: %s", e, exc_info=True)
-
-    @event_reminder.before_loop
-    async def before_event_reminder(self):
-        await self.bot.wait_until_ready()
+        except Exception:
+            log.exception("Ошибка event_reminder")
 
 
 async def setup(bot: commands.Bot):

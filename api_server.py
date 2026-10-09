@@ -126,34 +126,23 @@ async def api_handle_deploy_vacation_panel(request):
     if not channel_id:
         return aiohttp.web.json_response({"error": "channel_id required"}, status=400)
     try:
-        import sys, os
-        import json as _json
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from helpers import load_vacations, build_info_panel_embed, build_request_panel_embed
+        from services.vacation import build_info_panel_embed, build_request_panel_embed
         from cogs.vacations import RequestPanelView
+
         ch = bot.get_channel(int(channel_id))
         if not ch:
             return aiohttp.web.json_response({"error": f"Channel {channel_id} not found"}, status=404)
 
-        info_embed = build_info_panel_embed(load_vacations())
-        info_msg = await ch.send(embed=info_embed)
+        vacations = await bot.vacations.list_all()
 
-        request_embed = build_request_panel_embed()
-        view = RequestPanelView()
-        request_msg = await ch.send(embed=request_embed, view=view)
+        info_msg = await ch.send(embed=build_info_panel_embed(vacations))
+        request_msg = await ch.send(
+            embed=build_request_panel_embed(), view=RequestPanelView()
+        )
 
-        vacations = load_vacations()
-        raw = {}
-        if os.path.exists("vacations.json"):
-            with open("vacations.json", "r", encoding="utf-8") as f:
-                raw = _json.load(f)
-        raw["__panel__"] = {
-            "channel_id": int(channel_id),
-            "info_message_id": info_msg.id,
-            "request_message_id": request_msg.id,
-        }
-        with open("vacations.json", "w", encoding="utf-8") as f:
-            _json.dump(raw, f, ensure_ascii=False, indent=4)
+        await bot.vacations.set_panel(
+            int(channel_id), info_msg.id, request_msg.id
+        )
 
         return aiohttp.web.json_response({
             "ok": True,

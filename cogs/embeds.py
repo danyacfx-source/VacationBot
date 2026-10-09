@@ -1,12 +1,23 @@
-import sys
-import os
+"""Генератор эмбедов: /embed (модалка) и /embed_send (прямая отправка)."""
+
+from __future__ import annotations
+
+import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from ui import style
+
+log = logging.getLogger(__name__)
+
+
+def _resolve_color(raw: str | None) -> discord.Color:
+    """Парсинг цвета как в оригинале: config.EMBED_COLORS, иначе красный."""
+    color_str = (raw or "red").lower().strip()
+    return config.EMBED_COLORS.get(color_str, discord.Color.red())
 
 
 class EmbedModal(discord.ui.Modal, title="Генератор эмбедов"):
@@ -37,13 +48,10 @@ class EmbedModal(discord.ui.Modal, title="Генератор эмбедов"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        color_str = (self.embed_color.value or "red").lower().strip()
-        color = config.EMBED_COLORS.get(color_str, discord.Color.red())
-
         embed = discord.Embed(
             title=self.embed_title.value,
             description=self.embed_description.value,
-            color=color
+            color=_resolve_color(self.embed_color.value)
         )
 
         if self.embed_footer.value:
@@ -61,8 +69,10 @@ class EmbedCog(commands.Cog):
 
     @app_commands.command(name="embed", description="[Админ] Создать эмбед через модалку")
     async def embed_cmd(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("Нет прав.", ephemeral=True)
+        if not style.is_admin(interaction):
+            return await interaction.response.send_message(
+                embed=style.error("Нет прав."), ephemeral=True
+            )
         await interaction.response.send_modal(EmbedModal())
 
     @app_commands.command(name="embed_send", description="[Админ] Отправить эмбед в канал")
@@ -82,15 +92,15 @@ class EmbedCog(commands.Cog):
         color: str = "red",
         footer: str = "",
     ):
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("Нет прав.", ephemeral=True)
-
-        color_obj = config.EMBED_COLORS.get(color.lower().strip(), discord.Color.red())
+        if not style.is_admin(interaction):
+            return await interaction.response.send_message(
+                embed=style.error("Нет прав."), ephemeral=True
+            )
 
         embed = discord.Embed(
             title=title,
             description=description,
-            color=color_obj
+            color=_resolve_color(color)
         )
 
         if footer:
@@ -102,10 +112,12 @@ class EmbedCog(commands.Cog):
         )
 
         await interaction.response.send_message(
-            f"✅ Эмбед отправлен в {channel.mention}",
+            embed=style.success(
+                "✅ Готово", f"Эмбед отправлен в {channel.mention}"
+            ),
             ephemeral=True
         )
 
 
-async def setup(bot: commands.Bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(EmbedCog(bot))

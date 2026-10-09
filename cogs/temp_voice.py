@@ -1,15 +1,17 @@
+"""Временные голосовые каналы: создание по входу в триггер, управление, очистка."""
+
+from __future__ import annotations
+
 import asyncio
-import sys
-import os
 import logging
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from ui import style
 
-temp_channel_owners: dict[int, int] = {}
+log = logging.getLogger(__name__)
 
 _channel_locks: dict[int, asyncio.Lock] = {}
 
@@ -30,6 +32,10 @@ def _channel_lock(channel_id: int) -> asyncio.Lock:
     return lock
 
 
+async def _get_owner(bot, channel_id: int) -> int | None:
+    return await bot.temp_channels.get_owner(channel_id)
+
+
 class TempChannelKickModal(discord.ui.Modal, title="Выгнать участника"):
 
     target = discord.ui.TextInput(
@@ -40,19 +46,20 @@ class TempChannelKickModal(discord.ui.Modal, title="Выгнать участн�
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.user.voice or not interaction.user.voice.channel:
             return await interaction.response.send_message(
-                "Вы не в голосовом канале.", ephemeral=True
+                embed=style.error("Ошибка", "Вы не в голосовом канале."), ephemeral=True
             )
 
         vc = interaction.user.voice.channel
 
         if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
-                "Нельзя управлять этим каналом.", ephemeral=True
+                embed=style.error("Ошибка", "Нельзя управлять этим каналом."), ephemeral=True
             )
 
-        if temp_channel_owners.get(vc.id) != interaction.user.id:
+        owner_id = await _get_owner(interaction.client, vc.id)
+        if owner_id != interaction.user.id:
             return await interaction.response.send_message(
-                "Только владелец канала может выгонять.", ephemeral=True
+                embed=style.error("Ошибка", "Только владелец канала может выгонять."), ephemeral=True
             )
 
         raw = self.target.value.strip()
@@ -61,23 +68,29 @@ class TempChannelKickModal(discord.ui.Modal, title="Выгнать участн�
             uid = int(uid)
         except ValueError:
             return await interaction.response.send_message(
-                "Укажите ID участника.", ephemeral=True
+                embed=style.error("Ошибка", "Укажите ID участника."), ephemeral=True
             )
 
         member = interaction.guild.get_member(uid)
         if not member:
             return await interaction.response.send_message(
-                "Участник не найден.", ephemeral=True
+                embed=style.error("Ошибка", "Участник не найден."), ephemeral=True
             )
 
         if member.voice and member.voice.channel and member.voice.channel.id == vc.id:
-            await member.move_to(None, reason="Выгнан из временного канала")
+            try:
+                await member.move_to(None, reason="Выгнан из временного канала")
+            except Exception as e:
+                log.error("Ошибка выгна участника %s из канала %s: %s", member, vc.name, e)
+                return await interaction.response.send_message(
+                    embed=style.error("Ошибка", "Не удалось выгнать участника."), ephemeral=True
+                )
             await interaction.response.send_message(
-                f"✅ {member.mention} выгнан.", ephemeral=True
+                embed=style.success("Участник выгнан", f"✅ {member.mention} выгнан."), ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                "Участник не в вашем канале.", ephemeral=True
+                embed=style.error("Ошибка", "Участник не в вашем канале."), ephemeral=True
             )
 
 
@@ -92,25 +105,35 @@ class TempChannelRenameModal(discord.ui.Modal, title="Переименовать
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.user.voice or not interaction.user.voice.channel:
             return await interaction.response.send_message(
-                "Вы не в голосовом канале.", ephemeral=True
+                embed=style.error("Ошибка", "Вы не в голосовом канале."), ephemeral=True
             )
 
         vc = interaction.user.voice.channel
 
         if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
-                "Нельзя управлять этим каналом.", ephemeral=True
+                embed=style.error("Ошибка", "Нельзя управлять этим каналом."), ephemeral=True
             )
 
-        if temp_channel_owners.get(vc.id) != interaction.user.id:
+        owner_id = await _get_owner(interaction.client, vc.id)
+        if owner_id != interaction.user.id:
             return await interaction.response.send_message(
-                "Только владелец канала может переименовывать.", ephemeral=True
+                embed=style.error("Ошибка", "Только владелец канала может переименовывать."), ephemeral=True
             )
 
         old_name = vc.name
-        await vc.edit(name=self.new_name.value, reason="Переименован владельцем")
+        try:
+            await vc.edit(name=self.new_name.value, reason="Переименован владельцем")
+        except Exception as e:
+            log.error("Ошибка переименования канала %s: %s", vc.name, e)
+            return await interaction.response.send_message(
+                embed=style.error("Ошибка", "Не удалось переименовать канал."), ephemeral=True
+            )
         await interaction.response.send_message(
-            f"✅ Канал переименован: `{old_name}` → `{self.new_name.value}`",
+            embed=style.success(
+                "Канал переименован",
+                f"✅ Канал переименован: `{old_name}` → `{self.new_name.value}`"
+            ),
             ephemeral=True
         )
 
@@ -125,39 +148,48 @@ class TempChannelLimitModal(discord.ui.Modal, title="Лимит участник
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.user.voice or not interaction.user.voice.channel:
             return await interaction.response.send_message(
-                "Вы не в голосовом канале.", ephemeral=True
+                embed=style.error("Ошибка", "Вы не в голосовом канале."), ephemeral=True
             )
 
         vc = interaction.user.voice.channel
 
         if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
-                "Нельзя управлять этим каналом.", ephemeral=True
+                embed=style.error("Ошибка", "Нельзя управлять этим каналом."), ephemeral=True
             )
 
-        if temp_channel_owners.get(vc.id) != interaction.user.id:
+        owner_id = await _get_owner(interaction.client, vc.id)
+        if owner_id != interaction.user.id:
             return await interaction.response.send_message(
-                "Только владелец канала может менять лимит.", ephemeral=True
+                embed=style.error("Ошибка", "Только владелец канала может менять лимит."), ephemeral=True
             )
 
         try:
             n = int(self.limit.value)
         except ValueError:
             return await interaction.response.send_message(
-                "Введите число.", ephemeral=True
+                embed=style.error("Ошибка", "Введите число."), ephemeral=True
             )
 
         if n < 0 or n > 99:
             return await interaction.response.send_message(
-                "Лимит должен быть от 0 до 99.", ephemeral=True
+                embed=style.error("Ошибка", "Лимит должен быть от 0 до 99."), ephemeral=True
             )
 
-        await vc.edit(user_limit=n, reason="Лимит изменён владельцем")
+        try:
+            await vc.edit(user_limit=n, reason="Лимит изменён владельцем")
+        except Exception as e:
+            log.error("Ошибка изменения лимита канала %s: %s", vc.name, e)
+            return await interaction.response.send_message(
+                embed=style.error("Ошибка", "Не удалось изменить лимит."), ephemeral=True
+            )
         if n == 0:
             text = "✅ Лимит снят."
         else:
             text = f"✅ Лимит установлен: **{n}** участников."
-        await interaction.response.send_message(text, ephemeral=True)
+        await interaction.response.send_message(
+            embed=style.success("Лимит изменён", text), ephemeral=True
+        )
 
 
 class TempChannelView(discord.ui.View):
@@ -172,36 +204,52 @@ class TempChannelView(discord.ui.View):
     async def lock_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.voice or not interaction.user.voice.channel:
             return await interaction.response.send_message(
-                "Вы не в голосовом канале.", ephemeral=True
+                embed=style.error("Ошибка", "Вы не в голосовом канале."), ephemeral=True
             )
 
         vc = interaction.user.voice.channel
         if _is_trigger_channel(vc) or not _is_managed_category(vc.category_id):
             return await interaction.response.send_message(
-                "Нельзя управлять этим каналом.", ephemeral=True
+                embed=style.error("Ошибка", "Нельзя управлять этим каналом."), ephemeral=True
             )
 
-        if temp_channel_owners.get(vc.id) != interaction.user.id:
+        owner_id = await _get_owner(interaction.client, vc.id)
+        if owner_id != interaction.user.id:
             return await interaction.response.send_message(
-                "Только владелец канала может закрывать/открывать.", ephemeral=True
+                embed=style.error("Ошибка", "Только владелец канала может закрывать/открывать."), ephemeral=True
             )
 
         everyone = interaction.guild.default_role
         current = vc.overwrites_for(everyone)
         is_locked = current.connect is False
 
-        if is_locked:
-            current.connect = None
-            await vc.set_overwrite(everyone, overwrite=current, reason="Канал открыт")
-            button.label = "🔒 Закрыть"
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send("✅ Канал открыт.", ephemeral=True)
-        else:
-            current.connect = False
-            await vc.set_overwrite(everyone, overwrite=current, reason="Канал закрыт")
-            button.label = "🔓 Открыть"
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send("✅ Канал закрыт.", ephemeral=True)
+        try:
+            if is_locked:
+                current.connect = None
+                await vc.set_overwrite(everyone, overwrite=current, reason="Канал открыт")
+                button.label = "🔒 Закрыть"
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(
+                    embed=style.success("Канал открыт", "✅ Канал открыт."), ephemeral=True
+                )
+            else:
+                current.connect = False
+                await vc.set_overwrite(everyone, overwrite=current, reason="Канал закрыт")
+                button.label = "🔓 Открыть"
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(
+                    embed=style.success("Канал закрыт", "✅ Канал закрыт."), ephemeral=True
+                )
+        except Exception as e:
+            log.error("Ошибка переключения блокировки канала %s: %s", vc.name, e)
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    embed=style.error("Ошибка", "Не удалось изменить блокировку."), ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    embed=style.error("Ошибка", "Не удалось изменить блокировку."), ephemeral=True
+                )
 
     @discord.ui.button(
         label="👢 Выгнать",
@@ -228,7 +276,7 @@ class TempChannelView(discord.ui.View):
         await interaction.response.send_modal(TempChannelLimitModal())
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
-        logging.error("Ошибка в TempChannelView: %s", error, exc_info=True)
+        log.error("Ошибка в TempChannelView: %s", error, exc_info=True)
         try:
             if interaction.response.is_done():
                 await interaction.followup.send("Произошла ошибка.", ephemeral=True)
@@ -242,8 +290,15 @@ class TempVoiceCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @tasks.loop(seconds=60)
-    async def cleanup_empty_channels(self):
+    async def cog_load(self) -> None:
+        self.bot.scheduler.register_interval(
+            "temp_voice_cleanup", self.cleanup_empty_channels, seconds=60
+        )
+        self.bot.add_persistent_view(TempChannelView())
+
+    # ------------------------------------------------------------ фоновое задание
+
+    async def cleanup_empty_channels(self) -> None:
         for guild in self.bot.guilds:
             for cat_id in (config.VC_CATEGORY, config.VC_WARDogs_CATEGORY):
                 category = guild.get_channel(cat_id)
@@ -256,23 +311,22 @@ class TempVoiceCog(commands.Cog):
                     if not humans:
                         async with _channel_lock(ch.id):
                             try:
-                                temp_channel_owners.pop(ch.id, None)
+                                await self.bot.temp_channels.remove(ch.id)
                                 await ch.delete(reason="Периодическая очистка временных каналов")
-                                logging.info("Очищен пустой временный канал %s (периодическая уборка)", ch.name)
+                                log.info("Очищен пустой временный канал %s (периодическая уборка)", ch.name)
                             except discord.NotFound:
-                                temp_channel_owners.pop(ch.id, None)
+                                await self.bot.temp_channels.remove(ch.id)
                             except Exception as e:
-                                logging.error("Ошибка периодической очистки канала %s: %s", ch.name, e)
+                                log.error("Ошибка периодической очистки канала %s: %s", ch.name, e)
 
-    @cleanup_empty_channels.before_loop
-    async def before_cleanup(self):
-        await self.bot.wait_until_ready()
+    # ------------------------------------------------------------ слушатели
 
     @commands.Cog.listener()
     async def on_ready(self):
-        if not self.cleanup_empty_channels.is_running():
-            self.cleanup_empty_channels.start()
         try:
+            owners = await self.bot.temp_channels.all()
+            live_ids: set[int] = set()
+
             for guild in self.bot.guilds:
                 for cat_id in (config.VC_CATEGORY, config.VC_WARDogs_CATEGORY):
                     category = guild.get_channel(cat_id)
@@ -281,28 +335,33 @@ class TempVoiceCog(commands.Cog):
                     for ch in list(category.voice_channels):
                         if _is_trigger_channel(ch):
                             continue
+                        live_ids.add(ch.id)
                         humans = [m for m in ch.members if not m.bot]
                         if not humans:
                             async with _channel_lock(ch.id):
                                 try:
-                                    temp_channel_owners.pop(ch.id, None)
+                                    await self.bot.temp_channels.remove(ch.id)
                                     await ch.delete(reason="Очистка пустого временного канала")
-                                    logging.info("Очищен пустой временный канал %s", ch.name)
+                                    log.info("Очищен пустой временный канал %s", ch.name)
                                 except discord.NotFound:
-                                    temp_channel_owners.pop(ch.id, None)
+                                    await self.bot.temp_channels.remove(ch.id)
                                 except Exception as e:
-                                    logging.error("Ошибка очистки временного канала %s: %s", ch.name, e)
-                        elif ch.id not in temp_channel_owners:
-                            temp_channel_owners[ch.id] = humans[0].id
-                            logging.info("Восстановлен владелец канала %s теперь %s", ch.name, humans[0])
+                                    log.error("Ошибка очистки временного канала %s: %s", ch.name, e)
+                        elif ch.id not in owners:
+                            await self.bot.temp_channels.set_owner(ch.id, humans[0].id)
+                            log.info("Восстановлен владелец канала %s теперь %s", ch.name, humans[0])
 
                 for trigger_id in (config.VC_TRIGGER_CHANNEL, config.VC_WARDogs_TRIGGER_CHANNEL):
                     trigger = guild.get_channel(trigger_id)
                     if trigger and any(not m.bot for m in trigger.members):
                         first = next(m for m in trigger.members if not m.bot)
                         await self._create_temp_channel(first, trigger)
+
+            for ch_id in list(owners.keys()):
+                if ch_id not in live_ids:
+                    await self.bot.temp_channels.remove(ch_id)
         except Exception as e:
-            logging.error("Ошибка очистки временных каналов: %s", e)
+            log.error("Ошибка очистки временных каналов: %s", e)
 
     async def _create_temp_channel(self, member: discord.Member, trigger_channel):
         if trigger_channel.id == config.VC_WARDogs_TRIGGER_CHANNEL:
@@ -318,7 +377,7 @@ class TempVoiceCog(commands.Cog):
                 category=category,
                 reason="Временный канал"
             )
-            temp_channel_owners[vc.id] = member.id
+            await self.bot.temp_channels.set_owner(vc.id, member.id)
             moved = False
             for m in list(trigger_channel.members):
                 if m.bot:
@@ -327,13 +386,13 @@ class TempVoiceCog(commands.Cog):
                     await m.move_to(vc, reason="Перемещение в временный канал")
                     moved = True
                 except Exception as e:
-                    logging.error("Ошибка перемещения %s во временный канал: %s", m, e)
+                    log.error("Ошибка перемещения %s во временный канал: %s", m, e)
             if not moved:
-                temp_channel_owners.pop(vc.id, None)
+                await self.bot.temp_channels.remove(vc.id)
                 await vc.delete(reason="Временный канал: никто не перемещён")
-                logging.info("Удалён пустой временный канал (не удалось переместить участников)")
+                log.info("Удалён пустой временный канал (не удалось переместить участников)")
         except Exception as e:
-            logging.error("Ошибка создания временного канала: %s", e)
+            log.error("Ошибка создания временного канала: %s", e)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -352,32 +411,31 @@ class TempVoiceCog(commands.Cog):
             if after.channel and after.channel.id == vc.id:
                 return
 
-            leaving_owner = (
-                vc.id in temp_channel_owners and temp_channel_owners[vc.id] == member.id
-            )
+            owner_id = await self.bot.temp_channels.get_owner(vc.id)
+            leaving_owner = owner_id is not None and owner_id == member.id
             async with _channel_lock(vc.id):
                 remaining = [m for m in vc.members if not m.bot]
                 if not remaining:
                     try:
-                        temp_channel_owners.pop(vc.id, None)
+                        await self.bot.temp_channels.remove(vc.id)
                         await vc.delete(reason="Временный канал: все вышли")
-                        logging.info("Удалён пустой временный канал %s", vc.name)
+                        log.info("Удалён пустой временный канал %s", vc.name)
                     except discord.NotFound:
-                        temp_channel_owners.pop(vc.id, None)
+                        await self.bot.temp_channels.remove(vc.id)
                     except Exception as e:
-                        logging.error("Ошибка удаления временного канала: %s", e)
+                        log.error("Ошибка удаления временного канала: %s", e)
                 elif leaving_owner:
                     new_owner = None
                     for m in remaining:
-                        if temp_channel_owners.get(vc.id) != m.id:
+                        if owner_id != m.id:
                             new_owner = m
                             break
                     if new_owner is None:
                         new_owner = remaining[0]
-                    temp_channel_owners[vc.id] = new_owner.id
-                    logging.info("Владелец канала %s теперь %s", vc.name, new_owner)
-                    embed = discord.Embed(
-                        title="👑 Права канала переданы",
+                    await self.bot.temp_channels.set_owner(vc.id, new_owner.id)
+                    log.info("Владелец канала %s теперь %s", vc.name, new_owner)
+                    embed = style.base(
+                        "👑 Права канала переданы",
                         description=(
                             f"Предыдущий владелец **{member.display_name}** покинул канал.\n"
                             f"Новый владелец: **{new_owner.mention}**"
@@ -387,9 +445,9 @@ class TempVoiceCog(commands.Cog):
                     try:
                         await vc.send(embed=embed)
                     except discord.NotFound:
-                        logging.info("Канал %s уже удалён, уведомление о передаче прав пропущено", vc.name)
+                        log.info("Канал %s уже удалён, уведомление о передаче прав пропущено", vc.name)
                     except Exception as e:
-                        logging.error("Ошибка уведомления о передаче прав: %s", e)
+                        log.error("Ошибка уведомления о передаче прав: %s", e)
 
 
 async def setup(bot: commands.Bot):
