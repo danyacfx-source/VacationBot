@@ -173,7 +173,7 @@ class MiscCog(commands.Cog):
             )
             return
 
-        now = msk_now()
+        now = msk_now().replace(tzinfo=None)
         this_year = now.year
 
         upcoming: list[tuple[int, str, str]] = []
