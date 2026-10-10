@@ -153,7 +153,7 @@ class StatsCog(commands.Cog):
         await db.execute(
             "INSERT INTO member_stats (user_id, messages, voice_seconds, voice_joins) "
             "VALUES (?, 0, ?, 0) "
-            "ON CONFLICT(user_id) DO UPDATE SET voice_seconds = voice_seconds + ?",
+            "ON CONFLICT(user_id) DO UPDATE SET voice_seconds = member_stats.voice_seconds + ?",
             (user_id, secs, secs),
         )
         await db.execute(
@@ -196,7 +196,7 @@ class StatsCog(commands.Cog):
                 await self.bot.db.execute(
                     "INSERT INTO member_stats (user_id, messages, voice_seconds, voice_joins) "
                     "VALUES (?, 0, 0, 1) "
-                    "ON CONFLICT(user_id) DO UPDATE SET voice_joins = voice_joins + 1",
+                    "ON CONFLICT(user_id) DO UPDATE SET voice_joins = member_stats.voice_joins + 1",
                     (member.id,),
                 )
                 await self.bot.voice_open.open(member.id, after_channel.name)
@@ -223,7 +223,7 @@ class StatsCog(commands.Cog):
             await self.bot.db.execute(
                 "INSERT INTO member_stats (user_id, messages, voice_seconds, voice_joins) "
                 "VALUES (?, 1, 0, 0) "
-                "ON CONFLICT(user_id) DO UPDATE SET messages = messages + 1",
+                "ON CONFLICT(user_id) DO UPDATE SET messages = member_stats.messages + 1",
                 (message.author.id,),
             )
         except Exception:
